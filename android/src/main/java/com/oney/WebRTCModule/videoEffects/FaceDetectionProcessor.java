@@ -1,8 +1,16 @@
 package com.oney.WebRTCModule.videoEffects;
 
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.ImageFormat;
+import android.graphics.Rect;
+import android.graphics.YuvImage;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.util.Base64;
 import android.util.Log;
+
+import java.io.ByteArrayOutputStream;
 
 import androidx.annotation.NonNull;
 
@@ -48,6 +56,21 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
     private int frameSkipCount = 5; // Process every 5th frame for performance
     private int frameCounter = 0;
     private float blinkThreshold = 0.3f;
+
+    // Frame capture configuration
+    private boolean captureOnBlink = false;
+    private boolean cropToFace = true;
+    private float imageQuality = 0.7f;
+    private int maxImageWidth = 480;
+    private byte[] lastNv21Data = null;
+    private int lastFrameWidth = 0;
+    private int lastFrameHeight = 0;
+
+    // Closed-eye frame storage (for capturing at correct moment)
+    private byte[] closedEyeNv21Data = null;
+    private int closedEyeFrameWidth = 0;
+    private int closedEyeFrameHeight = 0;
+    private Rect closedEyeFaceBounds = null;
 
     // Dedicated face detection pipeline
     private HandlerThread faceDetectionThread;
@@ -143,6 +166,23 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
 
     public void setBlinkThreshold(float threshold) {
         this.blinkThreshold = threshold;
+    }
+
+    // Frame capture setters
+    public void setCaptureOnBlink(boolean capture) {
+        this.captureOnBlink = capture;
+    }
+
+    public void setCropToFace(boolean crop) {
+        this.cropToFace = crop;
+    }
+
+    public void setImageQuality(float quality) {
+        this.imageQuality = quality;
+    }
+
+    public void setMaxImageWidth(int width) {
+        this.maxImageWidth = width;
     }
 
     public void reset() {
@@ -365,14 +405,21 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
                     int uvIndex = ySize + row * width + col * 2;
                     int srcIndexU = row * strideU + col;
                     int srcIndexV = row * strideV + col;
-                    
-                    if (uvIndex + 1 < nv21.length && 
-                        srcIndexU < uBuffer.limit() && 
+
+                    if (uvIndex + 1 < nv21.length &&
+                        srcIndexU < uBuffer.limit() &&
                         srcIndexV < vBuffer.limit()) {
                         nv21[uvIndex] = vBuffer.get(srcIndexV);      // V comes first in NV21
                         nv21[uvIndex + 1] = uBuffer.get(srcIndexU);  // Then U
                     }
                 }
+            }
+
+            // Store NV21 data for frame capture if enabled
+            if (captureOnBlink) {
+                lastNv21Data = nv21.clone();
+                lastFrameWidth = width;
+                lastFrameHeight = height;
             }
 
             return InputImage.fromByteArray(
@@ -418,18 +465,19 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
             
             // Landmarks
             WritableMap landmarks = Arguments.createMap();
-            
+            Rect faceBounds = face.getBoundingBox();
+
             FaceLandmark leftEye = face.getLandmark(FaceLandmark.LEFT_EYE);
             WritableMap leftEyeData = processEye(
                     leftEye, face.getLeftEyeOpenProbability(),
-                    face.getTrackingId(), leftEyeStates, "left"
+                    face.getTrackingId(), leftEyeStates, "left", faceBounds
             );
             landmarks.putMap("leftEye", leftEyeData);
-            
+
             FaceLandmark rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE);
             WritableMap rightEyeData = processEye(
                     rightEye, face.getRightEyeOpenProbability(),
-                    face.getTrackingId(), rightEyeStates, "right"
+                    face.getTrackingId(), rightEyeStates, "right", faceBounds
             );
             landmarks.putMap("rightEye", rightEyeData);
             
@@ -448,9 +496,9 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
 
     private WritableMap processEye(FaceLandmark eyeLandmark, Float openProbability,
                                     Integer trackingId, Map<Integer, EyeState> eyeStates,
-                                    String eyeSide) {
+                                    String eyeSide, Rect faceBounds) {
         WritableMap eyeData = Arguments.createMap();
-        
+
         WritableMap position = Arguments.createMap();
         if (eyeLandmark != null && eyeLandmark.getPosition() != null) {
             position.putDouble("x", eyeLandmark.getPosition().x);
@@ -460,28 +508,76 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
             position.putDouble("y", 0);
         }
         eyeData.putMap("position", position);
-        
+
         if (openProbability != null && trackingId != null) {
             EyeState eyeState = eyeStates.get(trackingId);
             if (eyeState == null) {
                 eyeState = new EyeState();
                 eyeStates.put(trackingId, eyeState);
             }
-            
+
             eyeState.currentProbability = openProbability;
             eyeState.wasOpen = eyeState.isOpen;
             eyeState.isOpen = openProbability > blinkThreshold;
-            
+
+            // CAPTURE FRAME WHEN EYE CLOSES (transition: open → closed)
+            // This ensures we get the closed-eye image, not the open-eye image
+            if (eyeState.wasOpen && !eyeState.isOpen) {
+                if (captureOnBlink && lastNv21Data != null && faceBounds != null) {
+                    closedEyeNv21Data = lastNv21Data.clone();
+                    closedEyeFrameWidth = lastFrameWidth;
+                    closedEyeFrameHeight = lastFrameHeight;
+                    closedEyeFaceBounds = new Rect(faceBounds);
+                }
+            }
+
+            // DETECT BLINK (transition: closed → open)
             if (!eyeState.wasOpen && eyeState.isOpen) {
                 eyeState.blinkCount++;
-                
+
                 WritableMap blinkEvent = Arguments.createMap();
                 blinkEvent.putDouble("timestamp", System.currentTimeMillis());
                 blinkEvent.putString("eye", eyeSide);
                 blinkEvent.putInt("trackingId", trackingId);
+                blinkEvent.putInt("blinkCount", eyeState.blinkCount);
+
+                // Use STORED closed-eye frame instead of current frame
+                // This ensures we capture the frame with eyes closed, not open
+                if (captureOnBlink && closedEyeNv21Data != null && closedEyeFaceBounds != null) {
+                    // Temporarily swap to closed-eye data for capture
+                    byte[] savedNv21 = lastNv21Data;
+                    int savedWidth = lastFrameWidth;
+                    int savedHeight = lastFrameHeight;
+
+                    lastNv21Data = closedEyeNv21Data;
+                    lastFrameWidth = closedEyeFrameWidth;
+                    lastFrameHeight = closedEyeFrameHeight;
+
+                    String base64Image = captureFrameAsBase64(closedEyeFaceBounds);
+
+                    // Restore current frame data
+                    lastNv21Data = savedNv21;
+                    lastFrameWidth = savedWidth;
+                    lastFrameHeight = savedHeight;
+
+                    if (base64Image != null) {
+                        blinkEvent.putString("faceImage", base64Image);
+                        WritableMap boundsMap = Arguments.createMap();
+                        boundsMap.putInt("x", closedEyeFaceBounds.left);
+                        boundsMap.putInt("y", closedEyeFaceBounds.top);
+                        boundsMap.putInt("width", closedEyeFaceBounds.width());
+                        boundsMap.putInt("height", closedEyeFaceBounds.height());
+                        blinkEvent.putMap("faceBounds", boundsMap);
+                    }
+
+                    // Clear stored closed-eye data
+                    closedEyeNv21Data = null;
+                    closedEyeFaceBounds = null;
+                }
+
                 sendEvent(EVENT_BLINK_DETECTED, blinkEvent);
             }
-            
+
             eyeData.putBoolean("isOpen", eyeState.isOpen);
             eyeData.putDouble("openProbability", openProbability);
             eyeData.putInt("blinkCount", eyeState.blinkCount);
@@ -490,8 +586,74 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
             eyeData.putDouble("openProbability", 1.0);
             eyeData.putInt("blinkCount", 0);
         }
-        
+
         return eyeData;
+    }
+
+    /**
+     * Captures current frame and returns base64 encoded JPEG.
+     * @param faceBounds Face bounding box in pixel coordinates
+     * @return Base64 encoded JPEG string, or null on failure
+     */
+    private String captureFrameAsBase64(Rect faceBounds) {
+        if (lastNv21Data == null) return null;
+
+        try {
+            // Convert NV21 to Bitmap via YuvImage
+            YuvImage yuvImage = new YuvImage(
+                lastNv21Data, ImageFormat.NV21,
+                lastFrameWidth, lastFrameHeight, null);
+
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            yuvImage.compressToJpeg(new Rect(0, 0, lastFrameWidth, lastFrameHeight), 100, out);
+            Bitmap bitmap = BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size());
+
+            if (bitmap == null) return null;
+
+            Bitmap resultBitmap = bitmap;
+
+            // Crop to face if enabled
+            if (cropToFace && faceBounds != null && !faceBounds.isEmpty()) {
+                int padding = (int)(faceBounds.width() * 0.15);
+                Rect cropRect = new Rect(
+                    Math.max(0, faceBounds.left - padding),
+                    Math.max(0, faceBounds.top - padding),
+                    Math.min(bitmap.getWidth(), faceBounds.right + padding),
+                    Math.min(bitmap.getHeight(), faceBounds.bottom + padding)
+                );
+
+                if (cropRect.width() > 0 && cropRect.height() > 0) {
+                    resultBitmap = Bitmap.createBitmap(bitmap,
+                        cropRect.left, cropRect.top, cropRect.width(), cropRect.height());
+                    if (resultBitmap != bitmap) {
+                        bitmap.recycle();
+                    }
+                }
+            }
+
+            // Scale down if too large
+            if (resultBitmap.getWidth() > maxImageWidth) {
+                float scale = (float) maxImageWidth / resultBitmap.getWidth();
+                int newHeight = (int) (resultBitmap.getHeight() * scale);
+                Bitmap scaledBitmap = Bitmap.createScaledBitmap(resultBitmap, maxImageWidth, newHeight, true);
+                if (scaledBitmap != resultBitmap) {
+                    resultBitmap.recycle();
+                }
+                resultBitmap = scaledBitmap;
+            }
+
+            // Encode to JPEG base64
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            resultBitmap.compress(Bitmap.CompressFormat.JPEG, (int)(imageQuality * 100), baos);
+            String base64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+
+            resultBitmap.recycle();
+            return base64;
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error capturing frame: " + e.getMessage());
+            return null;
+        }
     }
 
     private void sendEvent(String eventName, WritableMap params) {
@@ -533,7 +695,18 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
         leftEyeStates.clear();
         rightEyeStates.clear();
         pipelineInitialized = false;
-        
+
+        // Clear frame capture data
+        lastNv21Data = null;
+        lastFrameWidth = 0;
+        lastFrameHeight = 0;
+
+        // Clear closed-eye frame data
+        closedEyeNv21Data = null;
+        closedEyeFrameWidth = 0;
+        closedEyeFrameHeight = 0;
+        closedEyeFaceBounds = null;
+
         Log.d(TAG, "Face detection pipeline cleaned up");
     }
 }

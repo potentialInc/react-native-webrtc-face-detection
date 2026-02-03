@@ -152,7 +152,20 @@ RCT_EXPORT_METHOD(enableFaceDetection
     if (config[@"blinkThreshold"]) {
         self.faceDetectionProcessor.blinkThreshold = [config[@"blinkThreshold"] floatValue];
     }
-    
+    // Frame capture config options
+    if (config[@"captureOnBlink"]) {
+        self.faceDetectionProcessor.captureOnBlink = [config[@"captureOnBlink"] boolValue];
+    }
+    if (config[@"cropToFace"]) {
+        self.faceDetectionProcessor.cropToFace = [config[@"cropToFace"] boolValue];
+    }
+    if (config[@"imageQuality"]) {
+        self.faceDetectionProcessor.imageQuality = [config[@"imageQuality"] floatValue];
+    }
+    if (config[@"maxImageWidth"]) {
+        self.faceDetectionProcessor.maxImageWidth = [config[@"maxImageWidth"] integerValue];
+    }
+
     resolve(@YES);
 }
 

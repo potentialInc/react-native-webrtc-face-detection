@@ -7,13 +7,41 @@ export interface FaceDetectionConfig {
      * Default: 3 (process every 3rd frame)
      */
     frameSkipCount?: number;
-    
+
     /**
      * Eye Aspect Ratio threshold for blink detection (iOS)
      * or open probability threshold (Android)
      * Default: 0.21 (iOS) / 0.3 (Android)
      */
     blinkThreshold?: number;
+
+    /**
+     * Enable capturing video frame when blink is detected.
+     * The captured image will be included in BlinkEvent.faceImage as base64 JPEG.
+     * @default false
+     */
+    captureOnBlink?: boolean;
+
+    /**
+     * When captureOnBlink is true, crop the image to face bounding box.
+     * If false, captures the full frame.
+     * @default true
+     */
+    cropToFace?: boolean;
+
+    /**
+     * JPEG compression quality for captured images (0.0 - 1.0).
+     * Lower values = smaller size, lower quality.
+     * @default 0.7
+     */
+    imageQuality?: number;
+
+    /**
+     * Maximum width of captured image in pixels.
+     * Image will be scaled down if larger, maintaining aspect ratio.
+     * @default 480
+     */
+    maxImageWidth?: number;
 }
 
 /**
@@ -171,15 +199,33 @@ export interface BlinkEvent {
      * Timestamp when the blink occurred (in milliseconds)
      */
     timestamp: number;
-    
+
     /**
      * Which eye blinked (available on some platforms)
      */
     eye?: 'left' | 'right';
-    
+
     /**
      * Face tracking ID associated with this blink
      */
     trackingId?: number;
+
+    /**
+     * Total number of blinks detected for this eye
+     */
+    blinkCount?: number;
+
+    /**
+     * Base64 encoded JPEG image of the face at blink moment.
+     * Only present when captureOnBlink config is enabled.
+     */
+    faceImage?: string;
+
+    /**
+     * Bounding box of the face in the original frame.
+     * Useful for UI positioning or additional processing.
+     * Only present when captureOnBlink config is enabled.
+     */
+    faceBounds?: BoundingBox;
 }
 

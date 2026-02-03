@@ -40,6 +40,14 @@
 @property (nonatomic, assign) NSInteger frameCounter;
 @property (nonatomic, strong) dispatch_queue_t processingQueue;
 @property (nonatomic, assign) BOOL isProcessing;
+// Private frame capture properties (public ones are in header)
+@property (nonatomic, assign) CVPixelBufferRef currentPixelBuffer;
+@property (nonatomic, assign) CGSize currentFrameSize;
+@property (nonatomic, strong) CIContext *ciContext;
+// Closed-eye frame storage (for capturing at correct moment)
+@property (nonatomic, assign) CVPixelBufferRef closedEyePixelBuffer;
+@property (nonatomic, assign) CGSize closedEyeFrameSize;
+@property (nonatomic, assign) CGRect closedEyeFaceBounds;
 @end
 
 @implementation FaceDetectionProcessor
@@ -57,6 +65,17 @@
         _frameCounter = 0;
         _isProcessing = NO;
         _processingQueue = dispatch_queue_create("com.webrtc.facedetection", DISPATCH_QUEUE_SERIAL);
+        // Frame capture defaults
+        _captureOnBlink = NO;
+        _cropToFace = YES;
+        _imageQuality = 0.7;
+        _maxImageWidth = 480;
+        _currentPixelBuffer = NULL;
+        _ciContext = [CIContext contextWithOptions:nil];
+        // Closed-eye frame storage initialization
+        _closedEyePixelBuffer = NULL;
+        _closedEyeFrameSize = CGSizeZero;
+        _closedEyeFaceBounds = CGRectZero;
     }
     return self;
 }
@@ -67,6 +86,13 @@
         [_rightEyeStates removeAllObjects];
         _frameCounter = 0;
         _isProcessing = NO;
+        // Clean up stored closed-eye buffer
+        if (_closedEyePixelBuffer) {
+            CVPixelBufferRelease(_closedEyePixelBuffer);
+            _closedEyePixelBuffer = NULL;
+        }
+        _closedEyeFrameSize = CGSizeZero;
+        _closedEyeFaceBounds = CGRectZero;
     }
 }
 
@@ -109,6 +135,12 @@
             return;
         }
 
+        // Store pixel buffer reference for frame capture if enabled
+        if (_captureOnBlink) {
+            _currentPixelBuffer = pixelBuffer;
+            _currentFrameSize = CGSizeMake(frame.width, frame.height);
+        }
+
         // Create face detection request with landmarks
         VNDetectFaceLandmarksRequest *faceRequest = [[VNDetectFaceLandmarksRequest alloc] initWithCompletionHandler:nil];
         faceRequest.revision = VNDetectFaceLandmarksRequestRevision3;
@@ -132,6 +164,11 @@
                            frameWidth:frame.width
                           frameHeight:frame.height
                             timestamp:frame.timeStampNs / 1000000]; // Convert to milliseconds
+
+        // Clear pixel buffer reference after processing
+        if (_captureOnBlink) {
+            _currentPixelBuffer = NULL;
+        }
 
         @synchronized (self) {
             _isProcessing = NO;
@@ -330,28 +367,71 @@
         eyeState.lastOpenTime = now;
     } else if (!currentlyOpen && eyeState.wasOpen) {
         eyeState.lastClosedTime = now;
+
+        // CAPTURE FRAME WHEN EYE CLOSES (not when it reopens)
+        // This ensures we get the closed-eye image, not the open-eye image
+        if (_captureOnBlink && _currentPixelBuffer) {
+            // Release previous stored buffer if exists
+            if (_closedEyePixelBuffer) {
+                CVPixelBufferRelease(_closedEyePixelBuffer);
+            }
+            // Retain and store the current frame (with closed eyes)
+            CVPixelBufferRetain(_currentPixelBuffer);
+            _closedEyePixelBuffer = _currentPixelBuffer;
+            _closedEyeFrameSize = _currentFrameSize;
+            _closedEyeFaceBounds = boundingBox;
+        }
     }
 
     // Detect blink: transition from closed -> open
-    // A blink should be quick (< 400ms closed duration)
+    // Match Android behavior: any closed->open transition counts as a blink
     if (!eyeState.wasOpen && eyeState.isOpen) {
-        NSTimeInterval closedDuration = now - eyeState.lastClosedTime;
+        eyeState.blinkCount++;
+        NSLog(@"[FaceDetection] Blink detected on %@ eye! Count: %ld, EAR: %.3f, avgEAR: %.3f",
+              eyeSide, (long)eyeState.blinkCount, ear, eyeState.avgEAR);
 
-        // Valid blink: eye was closed for 50-400ms
-        if (closedDuration > 0.05 && closedDuration < 0.4) {
-            eyeState.blinkCount++;
-            NSLog(@"[FaceDetection] Blink detected on %@ eye! Count: %ld, EAR: %.3f, avgEAR: %.3f, duration: %.3fs",
-                  eyeSide, (long)eyeState.blinkCount, ear, eyeState.avgEAR, closedDuration);
+        // Emit blink event
+        if (self.eventEmitter) {
+            NSMutableDictionary *blinkBody = [@{
+                @"timestamp": @(now * 1000),
+                @"eye": eyeSide,
+                @"trackingId": @(trackingId),
+                @"blinkCount": @(eyeState.blinkCount)
+            } mutableCopy];
 
-            // Emit blink event
-            if (self.eventEmitter) {
-                [self.eventEmitter sendEventWithName:@"blinkDetected" body:@{
-                    @"timestamp": @(now * 1000),
-                    @"eye": eyeSide,
-                    @"trackingId": @(trackingId),
-                    @"blinkCount": @(eyeState.blinkCount)
-                }];
+            // Use STORED closed-eye frame instead of current frame
+            // This ensures we capture the frame with eyes closed, not open
+            if (_captureOnBlink && _closedEyePixelBuffer) {
+                // Temporarily swap to closed-eye data for capture
+                CVPixelBufferRef savedBuffer = _currentPixelBuffer;
+                CGSize savedSize = _currentFrameSize;
+
+                _currentPixelBuffer = _closedEyePixelBuffer;
+                _currentFrameSize = _closedEyeFrameSize;
+
+                NSString *base64Image = [self captureFrameAsBase64WithFaceBounds:_closedEyeFaceBounds];
+
+                // Restore current frame references
+                _currentPixelBuffer = savedBuffer;
+                _currentFrameSize = savedSize;
+
+                // Clear stored closed-eye buffer
+                CVPixelBufferRelease(_closedEyePixelBuffer);
+                _closedEyePixelBuffer = NULL;
+
+                if (base64Image) {
+                    blinkBody[@"faceImage"] = base64Image;
+                    // Convert normalized bounds to pixel coordinates for faceBounds
+                    blinkBody[@"faceBounds"] = @{
+                        @"x": @(_closedEyeFaceBounds.origin.x * _closedEyeFrameSize.width),
+                        @"y": @((1.0 - _closedEyeFaceBounds.origin.y - _closedEyeFaceBounds.size.height) * _closedEyeFrameSize.height),
+                        @"width": @(_closedEyeFaceBounds.size.width * _closedEyeFrameSize.width),
+                        @"height": @(_closedEyeFaceBounds.size.height * _closedEyeFrameSize.height)
+                    };
+                }
             }
+
+            [self.eventEmitter sendEventWithName:@"blinkDetected" body:blinkBody];
         }
     }
 
@@ -475,6 +555,66 @@
     }
 
     return CGPointMake(sumX / count, sumY / count);
+}
+
+#pragma mark - Frame Capture
+
+/**
+ * Captures current frame and returns base64 encoded JPEG.
+ * @param normalizedBounds Face bounding box in normalized (0-1) coordinates from Vision
+ * @return Base64 encoded JPEG string, or nil on failure
+ */
+- (NSString *)captureFrameAsBase64WithFaceBounds:(CGRect)normalizedBounds {
+    if (!_currentPixelBuffer) return nil;
+
+    CVPixelBufferLockBaseAddress(_currentPixelBuffer, kCVPixelBufferLock_ReadOnly);
+    CIImage *ciImage = [CIImage imageWithCVPixelBuffer:_currentPixelBuffer];
+    CVPixelBufferUnlockBaseAddress(_currentPixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+    if (!ciImage) return nil;
+
+    // Crop to face if enabled and bounds are valid
+    if (_cropToFace && !CGRectIsEmpty(normalizedBounds)) {
+        CGFloat padding = 0.15; // 15% padding around face
+
+        // Convert normalized bounds to pixel coordinates
+        // Note: Vision framework returns bounds with origin at bottom-left
+        CGRect cropRect = CGRectMake(
+            (normalizedBounds.origin.x - padding) * _currentFrameSize.width,
+            (normalizedBounds.origin.y - padding) * _currentFrameSize.height,
+            (normalizedBounds.size.width + padding * 2) * _currentFrameSize.width,
+            (normalizedBounds.size.height + padding * 2) * _currentFrameSize.height
+        );
+
+        // Clamp to image bounds
+        cropRect = CGRectIntersection(cropRect, ciImage.extent);
+
+        if (!CGRectIsEmpty(cropRect) && cropRect.size.width > 0 && cropRect.size.height > 0) {
+            ciImage = [ciImage imageByCroppingToRect:cropRect];
+            // Reset origin after cropping
+            ciImage = [ciImage imageByApplyingTransform:CGAffineTransformMakeTranslation(-cropRect.origin.x, -cropRect.origin.y)];
+        }
+    }
+
+    // Scale down if too large
+    CGFloat currentWidth = ciImage.extent.size.width;
+    if (currentWidth > _maxImageWidth) {
+        CGFloat scale = _maxImageWidth / currentWidth;
+        ciImage = [ciImage imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+    }
+
+    // Create CGImage from CIImage
+    CGImageRef cgImage = [_ciContext createCGImage:ciImage fromRect:ciImage.extent];
+    if (!cgImage) return nil;
+
+    UIImage *image = [UIImage imageWithCGImage:cgImage];
+    CGImageRelease(cgImage);
+
+    // Convert to JPEG and base64
+    NSData *jpegData = UIImageJPEGRepresentation(image, _imageQuality);
+    if (!jpegData) return nil;
+
+    return [jpegData base64EncodedStringWithOptions:0];
 }
 
 @end
