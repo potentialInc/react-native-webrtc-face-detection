@@ -11,9 +11,8 @@ A powerful WebRTC module for React Native with **real-time face detection**, **e
 This fork extends the original react-native-webrtc with powerful face detection capabilities:
 
 ### 🎯 Real-Time Face Detection
-- **High-performance on-device processing** using native ML frameworks
-- **iOS**: Powered by Apple's Vision Framework
-- **Android**: Powered by Google ML Kit
+- **High-performance on-device processing** using Google ML Kit
+- **Cross-platform consistency**: Same ML Kit engine on both iOS and Android
 - Detect multiple faces simultaneously with bounding boxes
 
 ### 👁️ Eye Tracking
@@ -25,6 +24,12 @@ This fork extends the original react-native-webrtc with powerful face detection 
 - Accurate blink detection with configurable thresholds
 - Blink event callbacks for real-time interaction
 - `useBlinkDetection` React hook for easy integration
+
+### 📸 Frame Capture on Blink
+- **Automatic frame capture** when blink is detected
+- Optional **face cropping** with configurable padding
+- Configurable **image quality** and **max dimensions**
+- Returns **base64 JPEG** for easy display or upload
 
 ### 🎣 React Hooks
 - `useFaceDetection` - Easy-to-use hook for face detection
@@ -44,6 +49,7 @@ This fork extends the original react-native-webrtc with powerful face detection 
 | **Face Detection** | ✅ | ✅ | - | - | ✅ |
 | **Eye Tracking** | ✅ | ✅ | - | - | ✅ |
 | **Blink Detection** | ✅ | ✅ | - | - | ✅ |
+| **Frame Capture** | ✅ | ✅ | - | - | ✅ |
 | Unified Plan | ✅ | ✅ | - | - | ✅ |
 | Simulcast | ✅ | ✅ | - | - | ✅ |
 
@@ -133,15 +139,186 @@ function BlinkTracker() {
 ```typescript
 import { configureWebRTC } from 'react-native-webrtc-face-detection';
 
-// Configure face detection settings
+// Enable face detection feature (call once at app startup)
 configureWebRTC({
-  faceDetection: {
-    enabled: true,
-    minFaceSize: 0.1, // Minimum face size as ratio of frame
-    maxFaces: 5, // Maximum number of faces to detect
-    trackingEnabled: true, // Enable face tracking
-  },
+  enableFaceDetection: true,
 });
+```
+
+### Blink Capture (Standalone Camera - No WebRTC)
+
+Use face detection with just the camera, without WebRTC peer connections:
+
+```typescript
+import { useState, useEffect } from 'react';
+import { View, Text, Image } from 'react-native';
+import {
+  mediaDevices,
+  RTCView,
+  MediaStream,
+  useBlinkDetection,
+  configureWebRTC,
+} from 'react-native-webrtc-face-detection';
+
+// Enable face detection (call once at app startup)
+configureWebRTC({ enableFaceDetection: true });
+
+function BlinkCaptureCamera() {
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+
+  const videoTrack = stream?.getVideoTracks()[0] ?? null;
+
+  // Blink detection with frame capture
+  const { blinkCount, recentBlinks, enable, disable } = useBlinkDetection(videoTrack, {
+    captureOnBlink: true,    // Capture frame on blink
+    cropToFace: true,        // Crop to face region
+    imageQuality: 0.8,       // JPEG quality (0.0-1.0)
+    maxImageWidth: 480,      // Scale down if wider
+  });
+
+  // Start camera
+  useEffect(() => {
+    const startCamera = async () => {
+      const mediaStream = await mediaDevices.getUserMedia({
+        video: { facingMode: 'user' },
+        audio: false,
+      });
+      setStream(mediaStream);
+    };
+    startCamera();
+    return () => { stream?.release(); };
+  }, []);
+
+  // Enable detection when track is ready
+  useEffect(() => {
+    if (videoTrack) enable();
+    return () => { disable(); };
+  }, [videoTrack]);
+
+  // Get latest captured image
+  useEffect(() => {
+    const latestBlink = recentBlinks[recentBlinks.length - 1];
+    if (latestBlink?.faceImage) {
+      setCapturedImage(latestBlink.faceImage);
+    }
+  }, [recentBlinks]);
+
+  return (
+    <View style={{ flex: 1 }}>
+      {stream && (
+        <RTCView
+          streamURL={stream.toURL()}
+          style={{ width: 300, height: 400 }}
+          mirror={true}
+        />
+      )}
+      <Text>Blinks: {blinkCount}</Text>
+      {capturedImage && (
+        <Image
+          source={{ uri: `data:image/jpeg;base64,${capturedImage}` }}
+          style={{ width: 120, height: 120, borderRadius: 8 }}
+        />
+      )}
+    </View>
+  );
+}
+```
+
+### Video Calling with Face Detection
+
+Full WebRTC video call with face detection overlay:
+
+```typescript
+import { useState, useEffect } from 'react';
+import { View, Text } from 'react-native';
+import {
+  RTCPeerConnection,
+  RTCView,
+  mediaDevices,
+  useFaceDetection,
+  useBlinkDetection,
+  configureWebRTC,
+} from 'react-native-webrtc-face-detection';
+
+configureWebRTC({ enableFaceDetection: true });
+
+function VideoCallWithFaceDetection() {
+  const [localStream, setLocalStream] = useState(null);
+  const [remoteStream, setRemoteStream] = useState(null);
+  const [peerConnection, setPeerConnection] = useState(null);
+
+  const localVideoTrack = localStream?.getVideoTracks()[0] ?? null;
+
+  // Face detection on local video
+  const { detectionResult } = useFaceDetection(localVideoTrack);
+
+  // Blink detection with capture
+  const { blinkCount, recentBlinks } = useBlinkDetection(localVideoTrack, {
+    captureOnBlink: true,
+    cropToFace: true,
+  });
+
+  useEffect(() => {
+    const setupCall = async () => {
+      // Get local media
+      const stream = await mediaDevices.getUserMedia({
+        video: { facingMode: 'user' },
+        audio: true,
+      });
+      setLocalStream(stream);
+
+      // Create peer connection
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      });
+
+      // Add tracks to connection
+      stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+      // Handle remote stream
+      pc.ontrack = (event) => setRemoteStream(event.streams[0]);
+
+      setPeerConnection(pc);
+      // ... add signaling logic (offer/answer exchange)
+    };
+
+    setupCall();
+    return () => {
+      peerConnection?.close();
+      localStream?.release();
+    };
+  }, []);
+
+  return (
+    <View style={{ flex: 1 }}>
+      {/* Remote video (full screen) */}
+      {remoteStream && (
+        <RTCView
+          streamURL={remoteStream.toURL()}
+          style={{ flex: 1 }}
+          objectFit="cover"
+        />
+      )}
+
+      {/* Local video (picture-in-picture) */}
+      {localStream && (
+        <RTCView
+          streamURL={localStream.toURL()}
+          style={{ width: 100, height: 150, position: 'absolute', top: 20, right: 20 }}
+          mirror={true}
+        />
+      )}
+
+      {/* Face detection info */}
+      <View style={{ position: 'absolute', bottom: 20, left: 20 }}>
+        <Text style={{ color: 'white' }}>
+          Faces: {detectionResult?.faces.length ?? 0} | Blinks: {blinkCount}
+        </Text>
+      </View>
+    </View>
+  );
+}
 ```
 
 ## 📚 Documentation
@@ -156,15 +333,28 @@ configureWebRTC({
 
 ## 🔧 API Reference
 
+### Configuration
+
+```typescript
+// Face detection options (passed to hooks)
+interface FaceDetectionConfig {
+  frameSkipCount?: number;    // Process every Nth frame (default: 3)
+  blinkThreshold?: number;    // Eye open probability threshold (default: 0.3)
+  captureOnBlink?: boolean;   // Capture frame on blink (default: false)
+  cropToFace?: boolean;       // Crop to face bounds (default: true)
+  imageQuality?: number;      // JPEG quality 0.0-1.0 (default: 0.7)
+  maxImageWidth?: number;     // Max image width in pixels (default: 480)
+}
+```
+
 ### Types
 
 ```typescript
 interface Face {
-  boundingBox: BoundingBox;
+  bounds: BoundingBox;
   landmarks?: FaceLandmarks;
-  leftEyeOpenProbability?: number;
-  rightEyeOpenProbability?: number;
-  smilingProbability?: number;
+  confidence: number;
+  trackingId?: number;
   headPose?: HeadPose;
 }
 
@@ -175,6 +365,18 @@ interface BoundingBox {
   height: number;
 }
 
+interface FaceLandmarks {
+  leftEye: EyeData;
+  rightEye: EyeData;
+}
+
+interface EyeData {
+  position: { x: number; y: number };
+  isOpen: boolean;
+  openProbability: number;  // 0.0 (closed) to 1.0 (open)
+  blinkCount: number;
+}
+
 interface HeadPose {
   yaw: number;   // Left/right rotation
   pitch: number; // Up/down rotation
@@ -182,9 +384,19 @@ interface HeadPose {
 }
 
 interface BlinkEvent {
+  timestamp: number;          // Blink timestamp (ms)
+  eye: 'left' | 'right';     // Which eye blinked
+  trackingId?: number;        // Face tracking ID
+  blinkCount?: number;        // Total blinks for this eye
+  faceImage?: string;         // Base64 JPEG (if captureOnBlink: true)
+  faceBounds?: BoundingBox;   // Face bounds at capture time
+}
+
+interface FaceDetectionResult {
+  faces: Face[];
   timestamp: number;
-  eye: 'left' | 'right' | 'both';
-  duration?: number;
+  frameWidth: number;
+  frameHeight: number;
 }
 ```
 
@@ -220,9 +432,10 @@ This project is a fork of [react-native-webrtc](https://github.com/react-native-
 - **WebRTC**: Built on [Jitsi's WebRTC builds](https://github.com/jitsi/webrtc)
 
 ### What's Added in This Fork
-- Real-time face detection using native ML frameworks
+- Real-time face detection using Google ML Kit (iOS & Android)
 - Eye tracking with openness probability
 - Blink detection with React hooks
+- **Frame capture on blink** with face cropping
 - Head pose estimation
 - `useFaceDetection` and `useBlinkDetection` hooks
 - Face detection processor architecture for Android and iOS

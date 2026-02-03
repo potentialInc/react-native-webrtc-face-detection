@@ -1,19 +1,18 @@
 #import "FaceDetectionProcessor.h"
+#import "I420Converter.h"
 #import <React/RCTEventEmitter.h>
 #import <WebRTC/RTCVideoFrame.h>
 #import <WebRTC/RTCVideoFrameBuffer.h>
+#import <WebRTC/RTCCVPixelBuffer.h>
 #import <CoreVideo/CoreVideo.h>
+@import MLKitVision;
 
-// Eye state tracking for each eye (per face, per eye side)
+// Simple eye state tracking (matching Android)
 @interface EyeState : NSObject
 @property (nonatomic, assign) BOOL isOpen;
 @property (nonatomic, assign) BOOL wasOpen;
 @property (nonatomic, assign) NSInteger blinkCount;
-@property (nonatomic, assign) CGFloat currentEAR;
-@property (nonatomic, assign) CGFloat avgEAR;           // Per-eye average EAR (NOT static!)
-@property (nonatomic, assign) NSInteger sampleCount;    // Number of samples for avgEAR
-@property (nonatomic, assign) NSTimeInterval lastOpenTime;  // For time-based detection
-@property (nonatomic, assign) NSTimeInterval lastClosedTime;
+@property (nonatomic, assign) CGFloat currentProbability;
 @end
 
 @implementation EyeState
@@ -23,31 +22,29 @@
         _isOpen = YES;
         _wasOpen = YES;
         _blinkCount = 0;
-        _currentEAR = 0.3;  // Default reasonable EAR
-        _avgEAR = 0.3;      // Initial average
-        _sampleCount = 0;
-        _lastOpenTime = 0;
-        _lastClosedTime = 0;
+        _currentProbability = 1.0;
     }
     return self;
 }
 @end
 
 @interface FaceDetectionProcessor()
-@property (nonatomic, strong) VNSequenceRequestHandler *sequenceRequestHandler;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, EyeState *> *leftEyeStates;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, EyeState *> *rightEyeStates;
+@property (nonatomic, strong) MLKFaceDetector *faceDetector;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, EyeState *> *leftEyeStates;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, EyeState *> *rightEyeStates;
 @property (nonatomic, assign) NSInteger frameCounter;
 @property (nonatomic, strong) dispatch_queue_t processingQueue;
 @property (nonatomic, assign) BOOL isProcessing;
-// Private frame capture properties (public ones are in header)
+// Frame capture properties
 @property (nonatomic, assign) CVPixelBufferRef currentPixelBuffer;
 @property (nonatomic, assign) CGSize currentFrameSize;
 @property (nonatomic, strong) CIContext *ciContext;
-// Closed-eye frame storage (for capturing at correct moment)
+// Closed-eye frame storage
 @property (nonatomic, assign) CVPixelBufferRef closedEyePixelBuffer;
 @property (nonatomic, assign) CGSize closedEyeFrameSize;
 @property (nonatomic, assign) CGRect closedEyeFaceBounds;
+// I420 to BGRA conversion
+@property (nonatomic, strong) I420Converter *i420Converter;
 @end
 
 @implementation FaceDetectionProcessor
@@ -57,9 +54,8 @@
     if (self) {
         _eventEmitter = eventEmitter;
         _isEnabled = NO;
-        _frameSkipCount = 2; // Process every 2nd frame for better responsiveness
-        _blinkThreshold = 0.6; // 60% of average EAR indicates closed eye (more sensitive)
-        _sequenceRequestHandler = [[VNSequenceRequestHandler alloc] init];
+        _frameSkipCount = 2;
+        _blinkThreshold = 0.3; // Same as Android (probability-based)
         _leftEyeStates = [NSMutableDictionary dictionary];
         _rightEyeStates = [NSMutableDictionary dictionary];
         _frameCounter = 0;
@@ -72,12 +68,26 @@
         _maxImageWidth = 480;
         _currentPixelBuffer = NULL;
         _ciContext = [CIContext contextWithOptions:nil];
-        // Closed-eye frame storage initialization
         _closedEyePixelBuffer = NULL;
         _closedEyeFrameSize = CGSizeZero;
         _closedEyeFaceBounds = CGRectZero;
+
+        [self initializeFaceDetector];
     }
     return self;
+}
+
+- (void)initializeFaceDetector {
+    MLKFaceDetectorOptions *options = [[MLKFaceDetectorOptions alloc] init];
+    options.performanceMode = MLKFaceDetectorPerformanceModeFast;
+    options.landmarkMode = MLKFaceDetectorLandmarkModeAll;
+    options.classificationMode = MLKFaceDetectorClassificationModeAll; // KEY: enables eye probability
+    options.contourMode = MLKFaceDetectorContourModeNone;
+    options.minFaceSize = 0.15;
+    options.trackingEnabled = YES;
+
+    self.faceDetector = [MLKFaceDetector faceDetectorWithOptions:options];
+    NSLog(@"[FaceDetection] ML Kit FaceDetector initialized");
 }
 
 - (void)reset {
@@ -86,7 +96,10 @@
         [_rightEyeStates removeAllObjects];
         _frameCounter = 0;
         _isProcessing = NO;
-        // Clean up stored closed-eye buffer
+        if (_currentPixelBuffer) {
+            CVPixelBufferRelease(_currentPixelBuffer);
+            _currentPixelBuffer = NULL;
+        }
         if (_closedEyePixelBuffer) {
             CVPixelBufferRelease(_closedEyePixelBuffer);
             _closedEyePixelBuffer = NULL;
@@ -104,69 +117,129 @@
     @synchronized (self) {
         _frameCounter++;
 
-        // Skip frames for performance
         if (_frameCounter % _frameSkipCount != 0) {
             return frame;
         }
 
-        // Skip if already processing
         if (_isProcessing) {
             return frame;
         }
         _isProcessing = YES;
     }
 
-    // Process frame asynchronously to avoid blocking the video pipeline
+    // Get pixel buffer BEFORE async dispatch (while frame is still valid)
+    // Note: pixelBufferFromFrame returns a RETAINED buffer that we must release
+    CVPixelBufferRef pixelBuffer = [self pixelBufferFromFrame:frame];
+    if (!pixelBuffer) {
+        @synchronized (self) {
+            _isProcessing = NO;
+        }
+        return frame;
+    }
+
+    // Capture frame metadata before async dispatch (buffer already retained)
+    int32_t frameWidth = frame.width;
+    int32_t frameHeight = frame.height;
+    int64_t timestamp = frame.timeStampNs;
+
     dispatch_async(_processingQueue, ^{
-        [self processFrame:frame];
+        [self processFrameWithPixelBuffer:pixelBuffer
+                                    width:frameWidth
+                                   height:frameHeight
+                                timestamp:timestamp];
+        CVPixelBufferRelease(pixelBuffer);
     });
 
     return frame;
 }
 
-- (void)processFrame:(RTCVideoFrame *)frame {
+- (void)processFrameWithPixelBuffer:(CVPixelBufferRef)pixelBuffer
+                              width:(int32_t)frameWidth
+                             height:(int32_t)frameHeight
+                          timestamp:(int64_t)timestamp {
     @autoreleasepool {
-        // Convert RTCVideoFrame to CVPixelBuffer
-        CVPixelBufferRef pixelBuffer = [self pixelBufferFromFrame:frame];
-        if (!pixelBuffer) {
+        // Validate pixel buffer has actual image data
+        CVReturn lockResult = CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+        if (lockResult != kCVReturnSuccess) {
+            NSLog(@"[FaceDetection] Failed to lock pixel buffer: %d", lockResult);
             @synchronized (self) {
                 _isProcessing = NO;
             }
             return;
         }
 
-        // Store pixel buffer reference for frame capture if enabled
+        void *baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer);
+        size_t dataSize = CVPixelBufferGetDataSize(pixelBuffer);
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+        if (!baseAddress || dataSize == 0) {
+            NSLog(@"[FaceDetection] Pixel buffer has no image data");
+            @synchronized (self) {
+                _isProcessing = NO;
+            }
+            return;
+        }
+
+        // Store for frame capture
         if (_captureOnBlink) {
+            if (_currentPixelBuffer) {
+                CVPixelBufferRelease(_currentPixelBuffer);
+            }
+            CVPixelBufferRetain(pixelBuffer);
             _currentPixelBuffer = pixelBuffer;
-            _currentFrameSize = CGSizeMake(frame.width, frame.height);
+            _currentFrameSize = CGSizeMake(frameWidth, frameHeight);
         }
 
-        // Create face detection request with landmarks
-        VNDetectFaceLandmarksRequest *faceRequest = [[VNDetectFaceLandmarksRequest alloc] initWithCompletionHandler:nil];
-        faceRequest.revision = VNDetectFaceLandmarksRequestRevision3;
-
-        NSError *error = nil;
-        [self.sequenceRequestHandler performRequests:@[faceRequest]
-                                       onCVPixelBuffer:pixelBuffer
-                                               error:&error];
-
-        if (error) {
-            NSLog(@"[FaceDetection] Vision error: %@", error);
+        // Ensure face detector is initialized
+        if (!self.faceDetector) {
+            if (_captureOnBlink && _currentPixelBuffer) {
+                CVPixelBufferRelease(_currentPixelBuffer);
+                _currentPixelBuffer = NULL;
+            }
             @synchronized (self) {
                 _isProcessing = NO;
             }
             return;
         }
 
-        // Process results
-        NSArray<VNFaceObservation *> *faceObservations = faceRequest.results;
-        [self processFaceObservations:faceObservations
-                           frameWidth:frame.width
-                          frameHeight:frame.height
-                            timestamp:frame.timeStampNs / 1000000]; // Convert to milliseconds
+        // Convert CVPixelBuffer to UIImage for ML Kit
+        // Note: ML Kit's initWithBuffer: expects CMSampleBufferRef, not CVPixelBufferRef
+        UIImage *uiImage = [self uiImageFromPixelBuffer:pixelBuffer];
+        if (!uiImage) {
+            NSLog(@"[FaceDetection] Failed to create UIImage from pixel buffer");
+            if (_captureOnBlink && _currentPixelBuffer) {
+                CVPixelBufferRelease(_currentPixelBuffer);
+                _currentPixelBuffer = NULL;
+            }
+            @synchronized (self) {
+                _isProcessing = NO;
+            }
+            return;
+        }
 
-        // Clear pixel buffer reference after processing
-        if (_captureOnBlink) {
+        // Wrap ML Kit in @try/@catch to handle exceptions gracefully
+        @try {
+            // Create ML Kit vision image from UIImage
+            MLKVisionImage *visionImage = [[MLKVisionImage alloc] initWithImage:uiImage];
+            visionImage.orientation = UIImageOrientationRight;
+
+            NSError *error = nil;
+            NSArray<MLKFace *> *faces = [self.faceDetector resultsInImage:visionImage error:&error];
+
+            if (error) {
+                NSLog(@"[FaceDetection] ML Kit error: %@", error);
+            } else {
+                [self processFaceResults:faces
+                              frameWidth:frameWidth
+                             frameHeight:frameHeight
+                               timestamp:timestamp / 1000000];
+            }
+        } @catch (NSException *exception) {
+            NSLog(@"[FaceDetection] ML Kit exception: %@ - %@", exception.name, exception.reason);
+        }
+
+        if (_captureOnBlink && _currentPixelBuffer) {
+            CVPixelBufferRelease(_currentPixelBuffer);
             _currentPixelBuffer = NULL;
         }
 
@@ -176,110 +249,154 @@
     }
 }
 
+/**
+ * Returns a CVPixelBuffer from the frame. Handles both RTCCVPixelBuffer and I420 formats.
+ * IMPORTANT: The returned buffer is RETAINED - caller must release when done.
+ */
 - (CVPixelBufferRef)pixelBufferFromFrame:(RTCVideoFrame *)frame {
     id<RTCVideoFrameBuffer> buffer = frame.buffer;
 
-    // Try to get CVPixelBuffer directly
-    if ([buffer respondsToSelector:@selector(pixelBuffer)]) {
-        return [(id)buffer pixelBuffer];
+    // Check if buffer is already a CVPixelBuffer (most efficient path)
+    if ([buffer isKindOfClass:[RTCCVPixelBuffer class]]) {
+        CVPixelBufferRef pixelBuffer = [(RTCCVPixelBuffer *)buffer pixelBuffer];
+        CVPixelBufferRetain(pixelBuffer);  // Retain for caller
+        return pixelBuffer;
     }
 
-    // For I420 or other formats, we'd need conversion
-    return nil;
+    // Convert I420 buffer to CVPixelBuffer using Accelerate framework
+    // Note: pixelBufferFromI420 returns an already-retained buffer
+    return [self pixelBufferFromI420:[buffer toI420]];
 }
 
-- (void)processFaceObservations:(NSArray<VNFaceObservation *> *)observations
-                     frameWidth:(int)frameWidth
-                    frameHeight:(int)frameHeight
-                      timestamp:(int64_t)timestamp {
+/**
+ * Converts an I420 buffer to a BGRA CVPixelBuffer for ML Kit compatibility.
+ * Returns a retained buffer that must be released by the caller.
+ */
+- (CVPixelBufferRef)pixelBufferFromI420:(RTCI420Buffer *)i420Buffer {
+    if (!i420Buffer) {
+        return NULL;
+    }
+
+    if (_i420Converter == nil) {
+        I420Converter *converter = [[I420Converter alloc] init];
+        vImage_Error err = [converter prepareForAccelerateConversion];
+
+        if (err != kvImageNoError) {
+            NSLog(@"[FaceDetection] Error preparing I420Converter: %ld", err);
+            return NULL;
+        }
+
+        _i420Converter = converter;
+    }
+
+    return [_i420Converter convertI420ToPixelBuffer:i420Buffer];
+}
+
+/**
+ * Converts a CVPixelBuffer to UIImage for ML Kit processing.
+ * ML Kit's initWithBuffer: expects CMSampleBufferRef, not CVPixelBufferRef,
+ * so we convert to UIImage and use initWithImage: instead.
+ */
+- (UIImage *)uiImageFromPixelBuffer:(CVPixelBufferRef)pixelBuffer {
+    CIImage *ciImage = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+    if (!ciImage) {
+        return nil;
+    }
+
+    CGImageRef cgImage = [_ciContext createCGImage:ciImage fromRect:ciImage.extent];
+    if (!cgImage) {
+        return nil;
+    }
+
+    UIImage *uiImage = [UIImage imageWithCGImage:cgImage];
+    CGImageRelease(cgImage);
+
+    return uiImage;
+}
+
+- (void)processFaceResults:(NSArray<MLKFace *> *)faces
+                frameWidth:(int)frameWidth
+               frameHeight:(int)frameHeight
+                 timestamp:(int64_t)timestamp {
 
     NSMutableArray *facesArray = [NSMutableArray array];
 
-    for (NSInteger i = 0; i < observations.count; i++) {
-        VNFaceObservation *observation = observations[i];
+    for (NSInteger i = 0; i < faces.count; i++) {
+        MLKFace *face = faces[i];
 
-        NSString *faceKey = [NSString stringWithFormat:@"%ld", (long)i];
+        NSInteger trackingId = face.hasTrackingID ? face.trackingID : i;
+        NSNumber *trackingKey = @(trackingId);
 
-        // Get or create eye states for this face
-        EyeState *leftEyeState = self.leftEyeStates[faceKey];
+        // Get or create eye states
+        EyeState *leftEyeState = self.leftEyeStates[trackingKey];
         if (!leftEyeState) {
             leftEyeState = [[EyeState alloc] init];
-            self.leftEyeStates[faceKey] = leftEyeState;
+            self.leftEyeStates[trackingKey] = leftEyeState;
         }
 
-        EyeState *rightEyeState = self.rightEyeStates[faceKey];
+        EyeState *rightEyeState = self.rightEyeStates[trackingKey];
         if (!rightEyeState) {
             rightEyeState = [[EyeState alloc] init];
-            self.rightEyeStates[faceKey] = rightEyeState;
+            self.rightEyeStates[trackingKey] = rightEyeState;
         }
 
-        // Convert normalized coordinates to pixel coordinates
-        CGRect boundingBox = observation.boundingBox;
-        CGFloat x = boundingBox.origin.x * frameWidth;
-        CGFloat y = (1.0 - boundingBox.origin.y - boundingBox.size.height) * frameHeight;
-        CGFloat width = boundingBox.size.width * frameWidth;
-        CGFloat height = boundingBox.size.height * frameHeight;
-
+        // Bounding box
+        CGRect boundingBox = face.frame;
         NSDictionary *bounds = @{
-            @"x": @(x),
-            @"y": @(y),
-            @"width": @(width),
-            @"height": @(height)
+            @"x": @(boundingBox.origin.x),
+            @"y": @(boundingBox.origin.y),
+            @"width": @(boundingBox.size.width),
+            @"height": @(boundingBox.size.height)
         };
 
-        // Extract landmarks
-        VNFaceLandmarks2D *landmarks = observation.landmarks;
-        NSDictionary *landmarksDict = nil;
+        // Normalized bounds for frame capture (0-1 range)
+        CGRect normalizedBounds = CGRectMake(
+            boundingBox.origin.x / frameWidth,
+            boundingBox.origin.y / frameHeight,
+            boundingBox.size.width / frameWidth,
+            boundingBox.size.height / frameHeight
+        );
 
-        if (landmarks) {
-            // Process left eye
-            NSDictionary *leftEyeData = [self processEyeLandmarks:landmarks.leftEye
-                                                         eyeState:leftEyeState
-                                                          eyeSide:@"left"
-                                                       frameWidth:frameWidth
-                                                      frameHeight:frameHeight
-                                                      boundingBox:boundingBox
-                                                       trackingId:i];
+        // Process eyes with direct probability from ML Kit
+        NSDictionary *leftEyeData = [self processEye:face.leftEyeOpenProbability
+                                            eyeState:leftEyeState
+                                             eyeSide:@"left"
+                                          trackingId:trackingId
+                                    normalizedBounds:normalizedBounds
+                                              bounds:bounds];
 
-            // Process right eye
-            NSDictionary *rightEyeData = [self processEyeLandmarks:landmarks.rightEye
-                                                          eyeState:rightEyeState
-                                                           eyeSide:@"right"
-                                                        frameWidth:frameWidth
-                                                       frameHeight:frameHeight
-                                                       boundingBox:boundingBox
-                                                        trackingId:i];
+        NSDictionary *rightEyeData = [self processEye:face.rightEyeOpenProbability
+                                             eyeState:rightEyeState
+                                              eyeSide:@"right"
+                                           trackingId:trackingId
+                                     normalizedBounds:normalizedBounds
+                                               bounds:bounds];
 
-            landmarksDict = @{
-                @"leftEye": leftEyeData,
-                @"rightEye": rightEyeData
-            };
-        }
+        NSDictionary *landmarks = @{
+            @"leftEye": leftEyeData,
+            @"rightEye": rightEyeData
+        };
 
         // Build face object
-        NSMutableDictionary *face = [@{
+        NSMutableDictionary *faceDict = [@{
             @"bounds": bounds,
-            @"confidence": @(observation.confidence),
-            @"trackingId": @(i)
+            @"confidence": @1.0,
+            @"trackingId": @(trackingId)
         } mutableCopy];
 
-        if (landmarksDict) {
-            face[@"landmarks"] = landmarksDict;
-        }
+        faceDict[@"landmarks"] = landmarks;
 
-        // Add head pose if available
-        if (observation.yaw && observation.pitch && observation.roll) {
-            face[@"headPose"] = @{
-                @"yaw": observation.yaw,
-                @"pitch": observation.pitch,
-                @"roll": observation.roll
-            };
-        }
+        // Head pose
+        faceDict[@"headPose"] = @{
+            @"yaw": @(face.headEulerAngleY),
+            @"pitch": @(face.headEulerAngleX),
+            @"roll": @(face.headEulerAngleZ)
+        };
 
-        [facesArray addObject:face];
+        [facesArray addObject:faceDict];
     }
 
-    // Emit event to React Native
+    // Emit face detected event
     NSDictionary *result = @{
         @"faces": facesArray,
         @"timestamp": @(timestamp),
@@ -292,306 +409,135 @@
     }
 }
 
-- (NSDictionary *)processEyeLandmarks:(VNFaceLandmarkRegion2D *)eyeRegion
-                             eyeState:(EyeState *)eyeState
-                              eyeSide:(NSString *)eyeSide
-                           frameWidth:(int)frameWidth
-                          frameHeight:(int)frameHeight
-                          boundingBox:(CGRect)boundingBox
-                           trackingId:(NSInteger)trackingId {
+- (NSDictionary *)processEye:(CGFloat)openProbability
+                    eyeState:(EyeState *)eyeState
+                     eyeSide:(NSString *)eyeSide
+                  trackingId:(NSInteger)trackingId
+            normalizedBounds:(CGRect)normalizedBounds
+                      bounds:(NSDictionary *)bounds {
 
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-
-    // When eye landmarks can't be detected, likely the eye is closed or face angle is bad
-    if (!eyeRegion || eyeRegion.pointCount == 0) {
-        eyeState.wasOpen = eyeState.isOpen;
-
-        // Only mark as closed if we had good previous data
-        if (eyeState.sampleCount > 10) {
-            eyeState.isOpen = NO;
-            if (eyeState.wasOpen) {
-                eyeState.lastClosedTime = now;
-            }
-        }
-
-        // Check for blink completion (was closed, landmarks reappear = reopening)
+    // Handle missing probability (returns negative value when unavailable)
+    if (openProbability < 0) {
         return @{
             @"position": @{@"x": @0, @"y": @0},
             @"isOpen": @(eyeState.isOpen),
-            @"openProbability": @(eyeState.isOpen ? 1.0 : 0.0),
+            @"openProbability": @(eyeState.currentProbability),
             @"blinkCount": @(eyeState.blinkCount)
         };
     }
 
-    // Calculate eye center
-    CGPoint eyeCenter = [self calculateCenterOfPoints:eyeRegion.normalizedPoints count:eyeRegion.pointCount];
-
-    // Convert to frame coordinates
-    CGFloat eyeX = (boundingBox.origin.x + eyeCenter.x * boundingBox.size.width) * frameWidth;
-    CGFloat eyeY = (1.0 - (boundingBox.origin.y + eyeCenter.y * boundingBox.size.height)) * frameHeight;
-
-    // Calculate Eye Aspect Ratio (EAR) for blink detection
-    CGFloat ear = [self calculateEAR:eyeRegion.normalizedPoints count:eyeRegion.pointCount];
-    eyeState.currentEAR = ear;
-
-    // Update running average (per-eye, NOT static)
-    eyeState.sampleCount++;
-    if (eyeState.sampleCount <= 30) {
-        // Initial calibration phase - collect samples
-        eyeState.avgEAR = ((eyeState.avgEAR * (eyeState.sampleCount - 1)) + ear) / eyeState.sampleCount;
-    } else {
-        // After calibration, update with exponential moving average
-        // Only update average when eye is likely open (EAR above threshold)
-        if (ear > eyeState.avgEAR * 0.5) {
-            eyeState.avgEAR = eyeState.avgEAR * 0.98 + ear * 0.02;
-        }
-    }
-
-    // Determine if eye is open based on adaptive threshold
-    CGFloat adaptiveThreshold = eyeState.avgEAR * self.blinkThreshold;
-
+    eyeState.currentProbability = openProbability;
     eyeState.wasOpen = eyeState.isOpen;
-    BOOL currentlyOpen = ear > adaptiveThreshold;
-    eyeState.isOpen = currentlyOpen;
+    eyeState.isOpen = openProbability > self.blinkThreshold;
 
-    // Debug logging every 30 frames (about once per second)
+    // Debug logging
     static NSInteger debugCounter = 0;
     debugCounter++;
     if (debugCounter % 30 == 0) {
-        NSLog(@"[FaceDetection] %@ eye - EAR: %.4f, avgEAR: %.4f, threshold: %.4f, isOpen: %@",
-              eyeSide, ear, eyeState.avgEAR, adaptiveThreshold, currentlyOpen ? @"YES" : @"NO");
+        NSLog(@"[FaceDetection] %@ eye - probability: %.4f, threshold: %.4f, isOpen: %@",
+              eyeSide, openProbability, self.blinkThreshold, eyeState.isOpen ? @"YES" : @"NO");
     }
 
-    // Track open/closed times
-    if (currentlyOpen && !eyeState.wasOpen) {
-        eyeState.lastOpenTime = now;
-    } else if (!currentlyOpen && eyeState.wasOpen) {
-        eyeState.lastClosedTime = now;
-
-        // CAPTURE FRAME WHEN EYE CLOSES (not when it reopens)
-        // This ensures we get the closed-eye image, not the open-eye image
+    // CAPTURE FRAME WHEN EYE CLOSES (open → closed transition)
+    if (eyeState.wasOpen && !eyeState.isOpen) {
         if (_captureOnBlink && _currentPixelBuffer) {
-            // Release previous stored buffer if exists
             if (_closedEyePixelBuffer) {
                 CVPixelBufferRelease(_closedEyePixelBuffer);
             }
-            // Retain and store the current frame (with closed eyes)
             CVPixelBufferRetain(_currentPixelBuffer);
             _closedEyePixelBuffer = _currentPixelBuffer;
             _closedEyeFrameSize = _currentFrameSize;
-            _closedEyeFaceBounds = boundingBox;
+            _closedEyeFaceBounds = normalizedBounds;
         }
     }
 
-    // Detect blink: transition from closed -> open
-    // Match Android behavior: any closed->open transition counts as a blink
+    // DETECT BLINK (closed → open transition) - matching Android behavior
     if (!eyeState.wasOpen && eyeState.isOpen) {
         eyeState.blinkCount++;
-        NSLog(@"[FaceDetection] Blink detected on %@ eye! Count: %ld, EAR: %.3f, avgEAR: %.3f",
-              eyeSide, (long)eyeState.blinkCount, ear, eyeState.avgEAR);
+        NSLog(@"[FaceDetection] Blink detected on %@ eye! Count: %ld, probability: %.3f",
+              eyeSide, (long)eyeState.blinkCount, openProbability);
 
-        // Emit blink event
         if (self.eventEmitter) {
             NSMutableDictionary *blinkBody = [@{
-                @"timestamp": @(now * 1000),
+                @"timestamp": @([[NSDate date] timeIntervalSince1970] * 1000),
                 @"eye": eyeSide,
                 @"trackingId": @(trackingId),
                 @"blinkCount": @(eyeState.blinkCount)
             } mutableCopy];
 
-            // Use STORED closed-eye frame instead of current frame
-            // This ensures we capture the frame with eyes closed, not open
+            // Use stored closed-eye frame
             if (_captureOnBlink && _closedEyePixelBuffer) {
-                // Temporarily swap to closed-eye data for capture
-                CVPixelBufferRef savedBuffer = _currentPixelBuffer;
-                CGSize savedSize = _currentFrameSize;
-
-                _currentPixelBuffer = _closedEyePixelBuffer;
-                _currentFrameSize = _closedEyeFrameSize;
-
-                NSString *base64Image = [self captureFrameAsBase64WithFaceBounds:_closedEyeFaceBounds];
-
-                // Restore current frame references
-                _currentPixelBuffer = savedBuffer;
-                _currentFrameSize = savedSize;
-
-                // Clear stored closed-eye buffer
-                CVPixelBufferRelease(_closedEyePixelBuffer);
-                _closedEyePixelBuffer = NULL;
+                NSString *base64Image = [self captureFrameAsBase64FromBuffer:_closedEyePixelBuffer
+                                                                       size:_closedEyeFrameSize
+                                                                 faceBounds:_closedEyeFaceBounds];
 
                 if (base64Image) {
                     blinkBody[@"faceImage"] = base64Image;
-                    // Convert normalized bounds to pixel coordinates for faceBounds
                     blinkBody[@"faceBounds"] = @{
                         @"x": @(_closedEyeFaceBounds.origin.x * _closedEyeFrameSize.width),
-                        @"y": @((1.0 - _closedEyeFaceBounds.origin.y - _closedEyeFaceBounds.size.height) * _closedEyeFrameSize.height),
+                        @"y": @(_closedEyeFaceBounds.origin.y * _closedEyeFrameSize.height),
                         @"width": @(_closedEyeFaceBounds.size.width * _closedEyeFrameSize.width),
                         @"height": @(_closedEyeFaceBounds.size.height * _closedEyeFrameSize.height)
                     };
                 }
+
+                CVPixelBufferRelease(_closedEyePixelBuffer);
+                _closedEyePixelBuffer = NULL;
             }
 
             [self.eventEmitter sendEventWithName:@"blinkDetected" body:blinkBody];
         }
     }
 
-    // Calculate open probability
-    // Map EAR to a 0-1 probability scale where:
-    // - Closed eye (EAR near threshold): ~0.0-0.3
-    // - Open eye (EAR at average): ~0.7-1.0
-    CGFloat openProbability = 0.0;
-    if (eyeState.avgEAR > 0.001) {
-        // Calculate how far the current EAR is from closed (threshold) to open (average)
-        CGFloat closedEAR = eyeState.avgEAR * self.blinkThreshold;
-        CGFloat range = eyeState.avgEAR - closedEAR;
-
-        if (range > 0.001) {
-            // Linear mapping from [closedEAR, avgEAR*1.2] to [0, 1]
-            openProbability = (ear - closedEAR) / (eyeState.avgEAR * 1.2 - closedEAR);
-            openProbability = MIN(1.0, MAX(0.0, openProbability));
-        } else {
-            openProbability = currentlyOpen ? 1.0 : 0.0;
-        }
-    }
-
     return @{
-        @"position": @{
-            @"x": @(eyeX),
-            @"y": @(eyeY)
-        },
+        @"position": @{@"x": @0, @"y": @0},
         @"isOpen": @(eyeState.isOpen),
         @"openProbability": @(openProbability),
         @"blinkCount": @(eyeState.blinkCount)
     };
 }
 
-- (CGFloat)calculateEAR:(const CGPoint *)points count:(NSUInteger)count {
-    if (count < 6) {
-        return 0.3; // Default if not enough points
-    }
-
-    // Apple Vision framework provides eye contour points
-    // The points are ordered around the eye contour
-    // We need to calculate vertical distances at multiple points
-
-    // Find leftmost and rightmost points (horizontal extremes)
-    NSUInteger leftIdx = 0, rightIdx = 0;
-    CGFloat minX = CGFLOAT_MAX, maxX = -CGFLOAT_MAX;
-
-    for (NSUInteger i = 0; i < count; i++) {
-        if (points[i].x < minX) {
-            minX = points[i].x;
-            leftIdx = i;
-        }
-        if (points[i].x > maxX) {
-            maxX = points[i].x;
-            rightIdx = i;
-        }
-    }
-
-    CGFloat horizontalDistance = maxX - minX;
-    if (horizontalDistance < 0.0001) return 0.3;
-
-    // Calculate vertical distances at multiple sample points across the eye
-    // This captures the eye opening better than just bounding box
-    CGFloat totalVerticalDistance = 0.0;
-    NSInteger sampleCount = 0;
-
-    // Sample at 25%, 50%, and 75% of the horizontal span
-    CGFloat samplePositions[] = {0.25, 0.5, 0.75};
-
-    for (int s = 0; s < 3; s++) {
-        CGFloat sampleX = minX + horizontalDistance * samplePositions[s];
-
-        // Find points closest to this X position on upper and lower parts
-        CGFloat upperY = -CGFLOAT_MAX;
-        CGFloat lowerY = CGFLOAT_MAX;
-        CGFloat tolerance = horizontalDistance * 0.15; // 15% tolerance
-
-        for (NSUInteger i = 0; i < count; i++) {
-            if (fabs(points[i].x - sampleX) < tolerance) {
-                // Determine if this is upper or lower lid based on position in contour
-                // Upper lid points typically have higher Y values (Vision uses bottom-left origin)
-                if (points[i].y > upperY) upperY = points[i].y;
-                if (points[i].y < lowerY) lowerY = points[i].y;
-            }
-        }
-
-        if (upperY > -CGFLOAT_MAX && lowerY < CGFLOAT_MAX && upperY > lowerY) {
-            totalVerticalDistance += (upperY - lowerY);
-            sampleCount++;
-        }
-    }
-
-    if (sampleCount == 0) {
-        // Fallback to simple bounding box approach
-        CGFloat minY = CGFLOAT_MAX, maxY = -CGFLOAT_MAX;
-        for (NSUInteger i = 0; i < count; i++) {
-            minY = MIN(minY, points[i].y);
-            maxY = MAX(maxY, points[i].y);
-        }
-        return (maxY - minY) / horizontalDistance;
-    }
-
-    CGFloat avgVerticalDistance = totalVerticalDistance / sampleCount;
-
-    // EAR = average vertical distance / horizontal distance
-    // For open eyes, this ratio is higher (~0.25-0.35)
-    // For closed eyes, this ratio is lower (~0.05-0.15)
-    CGFloat ear = avgVerticalDistance / horizontalDistance;
-
-    return ear;
-}
-
-- (CGPoint)calculateCenterOfPoints:(const CGPoint *)points count:(NSUInteger)count {
-    if (count == 0) {
-        return CGPointZero;
-    }
-
-    CGFloat sumX = 0, sumY = 0;
-    for (NSUInteger i = 0; i < count; i++) {
-        sumX += points[i].x;
-        sumY += points[i].y;
-    }
-
-    return CGPointMake(sumX / count, sumY / count);
-}
-
 #pragma mark - Frame Capture
 
-/**
- * Captures current frame and returns base64 encoded JPEG.
- * @param normalizedBounds Face bounding box in normalized (0-1) coordinates from Vision
- * @return Base64 encoded JPEG string, or nil on failure
- */
 - (NSString *)captureFrameAsBase64WithFaceBounds:(CGRect)normalizedBounds {
-    if (!_currentPixelBuffer) return nil;
+    return [self captureFrameAsBase64FromBuffer:_currentPixelBuffer
+                                           size:_currentFrameSize
+                                    faceBounds:normalizedBounds];
+}
 
-    CVPixelBufferLockBaseAddress(_currentPixelBuffer, kCVPixelBufferLock_ReadOnly);
-    CIImage *ciImage = [CIImage imageWithCVPixelBuffer:_currentPixelBuffer];
-    CVPixelBufferUnlockBaseAddress(_currentPixelBuffer, kCVPixelBufferLock_ReadOnly);
+- (NSString *)captureFrameAsBase64FromBuffer:(CVPixelBufferRef)pixelBuffer
+                                        size:(CGSize)frameSize
+                                  faceBounds:(CGRect)normalizedBounds {
+    if (!pixelBuffer) return nil;
 
-    if (!ciImage) return nil;
+    // Lock buffer for ENTIRE conversion process (CIImage is lazy - reads data on createCGImage)
+    CVReturn lockResult = CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+    if (lockResult != kCVReturnSuccess) {
+        NSLog(@"[FaceDetection] Failed to lock pixel buffer for capture");
+        return nil;
+    }
 
-    // Crop to face if enabled and bounds are valid
+    CIImage *ciImage = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+    if (!ciImage) {
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+        return nil;
+    }
+
+    // Crop to face if enabled
     if (_cropToFace && !CGRectIsEmpty(normalizedBounds)) {
-        CGFloat padding = 0.15; // 15% padding around face
+        CGFloat padding = 0.15;
 
-        // Convert normalized bounds to pixel coordinates
-        // Note: Vision framework returns bounds with origin at bottom-left
         CGRect cropRect = CGRectMake(
-            (normalizedBounds.origin.x - padding) * _currentFrameSize.width,
-            (normalizedBounds.origin.y - padding) * _currentFrameSize.height,
-            (normalizedBounds.size.width + padding * 2) * _currentFrameSize.width,
-            (normalizedBounds.size.height + padding * 2) * _currentFrameSize.height
+            (normalizedBounds.origin.x - padding) * frameSize.width,
+            (normalizedBounds.origin.y - padding) * frameSize.height,
+            (normalizedBounds.size.width + padding * 2) * frameSize.width,
+            (normalizedBounds.size.height + padding * 2) * frameSize.height
         );
 
-        // Clamp to image bounds
         cropRect = CGRectIntersection(cropRect, ciImage.extent);
 
         if (!CGRectIsEmpty(cropRect) && cropRect.size.width > 0 && cropRect.size.height > 0) {
             ciImage = [ciImage imageByCroppingToRect:cropRect];
-            // Reset origin after cropping
             ciImage = [ciImage imageByApplyingTransform:CGAffineTransformMakeTranslation(-cropRect.origin.x, -cropRect.origin.y)];
         }
     }
@@ -603,18 +549,36 @@
         ciImage = [ciImage imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
     }
 
-    // Create CGImage from CIImage
+    // Render CIImage to CGImage (this is when pixel data is actually read)
     CGImageRef cgImage = [_ciContext createCGImage:ciImage fromRect:ciImage.extent];
+
+    // Unlock AFTER rendering is complete
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
     if (!cgImage) return nil;
 
     UIImage *image = [UIImage imageWithCGImage:cgImage];
     CGImageRelease(cgImage);
 
-    // Convert to JPEG and base64
     NSData *jpegData = UIImageJPEGRepresentation(image, _imageQuality);
     if (!jpegData) return nil;
 
     return [jpegData base64EncodedStringWithOptions:0];
+}
+
+- (void)dealloc {
+    if (_currentPixelBuffer) {
+        CVPixelBufferRelease(_currentPixelBuffer);
+        _currentPixelBuffer = NULL;
+    }
+    if (_closedEyePixelBuffer) {
+        CVPixelBufferRelease(_closedEyePixelBuffer);
+        _closedEyePixelBuffer = NULL;
+    }
+    if (_i420Converter) {
+        [_i420Converter unprepareForAccelerateConversion];
+        _i420Converter = nil;
+    }
 }
 
 @end

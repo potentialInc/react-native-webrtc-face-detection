@@ -1,6 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <WebRTC/RTCVideoCapturer.h>
-#import <Vision/Vision.h>
+@import MLKitFaceDetection;
 #import "VideoFrameProcessor.h"
 
 @class RCTEventEmitter;
@@ -10,7 +10,7 @@
 @property (nonatomic, weak) RCTEventEmitter *eventEmitter;
 @property (nonatomic, assign) BOOL isEnabled;
 @property (nonatomic, assign) NSInteger frameSkipCount; // Process every Nth frame
-@property (nonatomic, assign) CGFloat blinkThreshold; // EAR threshold for blink detection
+@property (nonatomic, assign) CGFloat blinkThreshold; // Eye open probability threshold (0.0-1.0)
 
 // Frame capture configuration
 @property (nonatomic, assign) BOOL captureOnBlink;    // Enable frame capture on blink
