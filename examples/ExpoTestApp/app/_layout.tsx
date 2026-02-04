@@ -10,6 +10,7 @@ function TabBarIcon({ name, color }: { name: string; color: string }) {
     connection: '🔗',
     face: '👤',
     videocall: '📞',
+    capture: '📸',
   };
   return <Text style={{ fontSize: 24 }}>{icons[name] || '●'}</Text>;
 }
@@ -70,6 +71,14 @@ export default function RootLayout() {
             title: 'Call',
             headerTitle: 'Video Call',
             tabBarIcon: ({ color }) => <TabBarIcon name="videocall" color={color} />,
+          }}
+        />
+        <Tabs.Screen
+          name="blink-capture"
+          options={{
+            title: 'Capture',
+            headerTitle: 'Blink Capture',
+            tabBarIcon: ({ color }) => <TabBarIcon name="capture" color={color} />,
           }}
         />
       </Tabs>

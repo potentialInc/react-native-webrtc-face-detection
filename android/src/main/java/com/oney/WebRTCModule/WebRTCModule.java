@@ -1445,8 +1445,21 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
                 if (config.hasKey("blinkThreshold")) {
                     processor.setBlinkThreshold((float) config.getDouble("blinkThreshold"));
                 }
+                // Frame capture config options
+                if (config.hasKey("captureOnBlink")) {
+                    processor.setCaptureOnBlink(config.getBoolean("captureOnBlink"));
+                }
+                if (config.hasKey("cropToFace")) {
+                    processor.setCropToFace(config.getBoolean("cropToFace"));
+                }
+                if (config.hasKey("imageQuality")) {
+                    processor.setImageQuality((float) config.getDouble("imageQuality"));
+                }
+                if (config.hasKey("maxImageWidth")) {
+                    processor.setMaxImageWidth(config.getInt("maxImageWidth"));
+                }
             }
-            
+
             promise.resolve(true);
         } catch (Exception e) {
             promise.reject("E_FACE_DETECTION", "Failed to enable face detection: " + e.getMessage());
