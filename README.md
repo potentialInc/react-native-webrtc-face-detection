@@ -88,6 +88,17 @@ cd ios && pod install
 
 No additional setup required - ML Kit is automatically included.
 
+### Platform Requirements
+
+| Platform | Minimum Version | Notes |
+|----------|-----------------|-------|
+| iOS | 15.5+ | Required by Google ML Kit |
+| Android | API 21+ | Standard React Native requirement |
+| macOS | 10.13+ | Limited support |
+| tvOS | 16.0+ | Limited support |
+
+> **Note**: Face detection features require iOS 15.5+ due to Google ML Kit dependencies. If your app targets older iOS versions, face detection will not be available on those devices.
+
 ## 📖 Usage
 
 ### Basic Face Detection
