@@ -52,17 +52,17 @@ export interface FaceDetectionResult {
      * Array of detected faces in the frame
      */
     faces: Face[];
-    
+
     /**
      * Timestamp when the detection occurred (in milliseconds)
      */
     timestamp: number;
-    
+
     /**
      * Width of the video frame
      */
     frameWidth: number;
-    
+
     /**
      * Height of the video frame
      */
@@ -77,23 +77,23 @@ export interface Face {
      * Bounding box of the face in the frame
      */
     bounds: BoundingBox;
-    
+
     /**
      * Facial landmarks (eyes, nose, mouth, etc.)
      */
     landmarks: FaceLandmarks;
-    
+
     /**
      * Confidence score of face detection (0.0 to 1.0)
      */
     confidence: number;
-    
+
     /**
      * Unique tracking ID for this face across frames
      * Useful for tracking the same person over time
      */
     trackingId?: number;
-    
+
     /**
      * Head pose estimation (rotation angles)
      */
@@ -108,21 +108,57 @@ export interface BoundingBox {
      * X coordinate of top-left corner
      */
     x: number;
-    
+
     /**
      * Y coordinate of top-left corner
      */
     y: number;
-    
+
     /**
      * Width of the bounding box
      */
     width: number;
-    
+
     /**
      * Height of the bounding box
      */
     height: number;
+}
+
+/**
+ * Mouth landmark data
+ */
+export interface MouthData {
+    /**
+     * Position of the mouth center in the frame
+     */
+    position: {
+        x: number;
+        y: number;
+    };
+
+    /**
+     * Width of the mouth region
+     */
+    width: number;
+
+    /**
+     * Height of the mouth region
+     */
+    height: number;
+}
+
+/**
+ * Nose landmark data
+ */
+export interface NoseData {
+    /**
+     * Position of the nose base in the frame
+     */
+    position: {
+        x: number;
+        y: number;
+    };
 }
 
 /**
@@ -133,11 +169,21 @@ export interface FaceLandmarks {
      * Left eye data
      */
     leftEye: EyeData;
-    
+
     /**
      * Right eye data
      */
     rightEye: EyeData;
+
+    /**
+     * Mouth data (available when ML Kit detects mouth landmarks)
+     */
+    mouth?: MouthData;
+
+    /**
+     * Nose data (available when ML Kit detects nose landmark)
+     */
+    nose?: NoseData;
 }
 
 /**
@@ -151,17 +197,17 @@ export interface EyeData {
         x: number;
         y: number;
     };
-    
+
     /**
      * Whether the eye is currently open
      */
     isOpen: boolean;
-    
+
     /**
      * Probability that the eye is open (0.0 = closed, 1.0 = open)
      */
     openProbability: number;
-    
+
     /**
      * Number of blinks detected for this eye
      */
@@ -177,13 +223,13 @@ export interface HeadPose {
      * Negative = left, Positive = right
      */
     yaw: number;
-    
+
     /**
      * Up-down rotation (nodding)
      * Negative = down, Positive = up
      */
     pitch: number;
-    
+
     /**
      * Tilt rotation
      * Negative = tilt left, Positive = tilt right
@@ -229,3 +275,115 @@ export interface BlinkEvent {
     faceBounds?: BoundingBox;
 }
 
+/**
+ * Configuration for the FaceDetectionOverlay component
+ */
+export interface FaceDetectionOverlayConfig {
+    /**
+     * Show face bounding box
+     * @default true
+     */
+    showFaceBox?: boolean;
+
+    /**
+     * Show eye bounding boxes
+     * @default true
+     */
+    showEyeBoxes?: boolean;
+
+    /**
+     * Show mouth bounding box
+     * @default true
+     */
+    showMouthBox?: boolean;
+
+    /**
+     * Show head pose angles (yaw, pitch, roll)
+     * @default false
+     */
+    showHeadPose?: boolean;
+
+    /**
+     * Show eye status labels (open/closed)
+     * @default false
+     */
+    showEyeStatus?: boolean;
+
+    /**
+     * Color for face bounding box
+     * @default '#00FF00'
+     */
+    faceBoxColor?: string;
+
+    /**
+     * Color for eye bounding boxes
+     * @default '#00AAFF'
+     */
+    eyeBoxColor?: string;
+
+    /**
+     * Color for mouth bounding box
+     * @default '#FF00FF'
+     */
+    mouthBoxColor?: string;
+
+    /**
+     * Stroke width for all boxes
+     * @default 2
+     */
+    strokeWidth?: number;
+
+    /**
+     * Animation duration in milliseconds
+     * @default 100
+     */
+    animationDuration?: number;
+
+    /**
+     * Text color for labels
+     * @default '#FFFFFF'
+     */
+    labelColor?: string;
+
+    /**
+     * Font size for labels
+     * @default 10
+     */
+    labelFontSize?: number;
+
+    /**
+     * Size of eye marker boxes in frame pixels (scaled automatically)
+     * @default 30
+     */
+    eyeBoxSize?: number;
+
+    /**
+     * Color for eye boxes when eye is closed
+     * @default '#FF4444'
+     */
+    eyeClosedColor?: string;
+
+    /**
+     * Border radius for face bounding box
+     * @default 4
+     */
+    faceBoxBorderRadius?: number;
+
+    /**
+     * Border radius for eye boxes (set to eyeBoxSize/2 for circles)
+     * @default 2
+     */
+    eyeBoxBorderRadius?: number;
+
+    /**
+     * Border radius for mouth box
+     * @default 2
+     */
+    mouthBoxBorderRadius?: number;
+
+    /**
+     * Background color for head pose and eye status labels
+     * @default 'rgba(0, 0, 0, 0.6)'
+     */
+    labelBackgroundColor?: string;
+}

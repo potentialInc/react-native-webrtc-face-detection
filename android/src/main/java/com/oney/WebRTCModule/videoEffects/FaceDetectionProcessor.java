@@ -486,7 +486,36 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
                     face.getTrackingId(), rightEyeStates, "right", faceBounds
             );
             landmarks.putMap("rightEye", rightEyeData);
-            
+
+            // Extract mouth landmarks
+            FaceLandmark mouthBottom = face.getLandmark(FaceLandmark.MOUTH_BOTTOM);
+            FaceLandmark mouthLeft = face.getLandmark(FaceLandmark.MOUTH_LEFT);
+            FaceLandmark mouthRight = face.getLandmark(FaceLandmark.MOUTH_RIGHT);
+            if (mouthBottom != null && mouthLeft != null && mouthRight != null) {
+                WritableMap mouthData = Arguments.createMap();
+                WritableMap mouthPosition = Arguments.createMap();
+                float centerX = (mouthLeft.getPosition().x + mouthRight.getPosition().x) / 2.0f;
+                float centerY = mouthBottom.getPosition().y;
+                mouthPosition.putDouble("x", centerX);
+                mouthPosition.putDouble("y", centerY);
+                mouthData.putMap("position", mouthPosition);
+                float mouthWidth = Math.abs(mouthRight.getPosition().x - mouthLeft.getPosition().x);
+                mouthData.putDouble("width", mouthWidth);
+                mouthData.putDouble("height", mouthWidth * 0.5);
+                landmarks.putMap("mouth", mouthData);
+            }
+
+            // Extract nose landmark
+            FaceLandmark noseBase = face.getLandmark(FaceLandmark.NOSE_BASE);
+            if (noseBase != null) {
+                WritableMap noseData = Arguments.createMap();
+                WritableMap nosePosition = Arguments.createMap();
+                nosePosition.putDouble("x", noseBase.getPosition().x);
+                nosePosition.putDouble("y", noseBase.getPosition().y);
+                noseData.putMap("position", nosePosition);
+                landmarks.putMap("nose", noseData);
+            }
+
             faceMap.putMap("landmarks", landmarks);
             facesArray.pushMap(faceMap);
         }

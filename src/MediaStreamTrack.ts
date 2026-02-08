@@ -57,7 +57,7 @@ export default class MediaStreamTrack extends EventTarget<MediaStreamTrackEventM
     _muted: boolean;
     _peerConnectionId: number;
     _readyState: MediaStreamTrackState;
-    _faceDetectionEnabled: boolean = false;
+    _faceDetectionEnabled = false;
 
     readonly id: string;
     readonly kind: string;
@@ -236,7 +236,7 @@ export default class MediaStreamTrack extends EventTarget<MediaStreamTrackEventM
 
     /**
      * Enable face detection for this video track
-     * 
+     *
      * @param config Optional configuration for face detection
      * @returns Promise that resolves when face detection is enabled
      * @throws {Error} If face detection is disabled in module configuration
@@ -265,7 +265,7 @@ export default class MediaStreamTrack extends EventTarget<MediaStreamTrackEventM
 
     /**
      * Disable face detection for this video track
-     * 
+     *
      * @returns Promise that resolves when face detection is disabled
      */
     async disableFaceDetection(): Promise<void> {

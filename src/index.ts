@@ -9,6 +9,19 @@ if (WebRTCModule === null) {
 }
 
 import { setupNativeEvents } from './EventEmitter';
+import type {
+    FaceDetectionConfig,
+    FaceDetectionResult,
+    Face,
+    BoundingBox,
+    FaceLandmarks,
+    EyeData,
+    HeadPose,
+    BlinkEvent,
+    MouthData,
+    NoseData,
+    FaceDetectionOverlayConfig,
+} from './FaceDetection.types';
 import Logger from './Logger';
 import mediaDevices from './MediaDevices';
 import MediaStream from './MediaStream';
@@ -27,18 +40,9 @@ import RTCSessionDescription from './RTCSessionDescription';
 import RTCView, { type RTCVideoViewProps, type RTCIOSPIPOptions } from './RTCView';
 import ScreenCapturePickerView from './ScreenCapturePickerView';
 import { configureWebRTC, type WebRTCConfig } from './WebRTCModuleConfig';
-import { useFaceDetection } from './hooks/useFaceDetection';
+import FaceDetectionOverlay from './components/FaceDetectionOverlay';
 import { useBlinkDetection } from './hooks/useBlinkDetection';
-import type {
-    FaceDetectionConfig,
-    FaceDetectionResult,
-    Face,
-    BoundingBox,
-    FaceLandmarks,
-    EyeData,
-    HeadPose,
-    BlinkEvent,
-} from './FaceDetection.types';
+import { useFaceDetection } from './hooks/useFaceDetection';
 
 Logger.enable(`${Logger.ROOT_PREFIX}:*`);
 
@@ -73,6 +77,7 @@ export {
     // Face Detection
     useFaceDetection,
     useBlinkDetection,
+    FaceDetectionOverlay,
     type FaceDetectionConfig,
     type FaceDetectionResult,
     type Face,
@@ -81,6 +86,9 @@ export {
     type EyeData,
     type HeadPose,
     type BlinkEvent,
+    type MouthData,
+    type NoseData,
+    type FaceDetectionOverlayConfig,
 };
 
 declare const global: any;

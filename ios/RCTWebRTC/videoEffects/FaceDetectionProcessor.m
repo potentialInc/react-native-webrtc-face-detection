@@ -391,19 +391,48 @@
                                              eyeSide:@"left"
                                           trackingId:trackingId
                                     normalizedBounds:normalizedBounds
-                                              bounds:bounds];
+                                              bounds:bounds
+                                                face:face
+                                        landmarkType:MLKFaceLandmarkTypeLeftEye];
 
         NSDictionary *rightEyeData = [self processEye:face.rightEyeOpenProbability
                                              eyeState:rightEyeState
                                               eyeSide:@"right"
                                            trackingId:trackingId
                                      normalizedBounds:normalizedBounds
-                                               bounds:bounds];
+                                               bounds:bounds
+                                                 face:face
+                                         landmarkType:MLKFaceLandmarkTypeRightEye];
 
-        NSDictionary *landmarks = @{
-            @"leftEye": leftEyeData,
-            @"rightEye": rightEyeData
-        };
+        // Extract mouth landmarks
+        NSMutableDictionary *landmarksDict = [NSMutableDictionary dictionary];
+        landmarksDict[@"leftEye"] = leftEyeData;
+        landmarksDict[@"rightEye"] = rightEyeData;
+
+        MLKFaceLandmark *mouthBottom = [face landmarkOfType:MLKFaceLandmarkTypeMouthBottom];
+        MLKFaceLandmark *mouthLeft = [face landmarkOfType:MLKFaceLandmarkTypeMouthLeft];
+        MLKFaceLandmark *mouthRight = [face landmarkOfType:MLKFaceLandmarkTypeMouthRight];
+        if (mouthBottom && mouthLeft && mouthRight) {
+            CGFloat centerX = (mouthLeft.position.x + mouthRight.position.x) / 2.0;
+            CGFloat centerY = mouthBottom.position.y;
+            CGFloat mouthWidth = fabs(mouthRight.position.x - mouthLeft.position.x);
+            CGFloat mouthHeight = mouthWidth * 0.5;
+            landmarksDict[@"mouth"] = @{
+                @"position": @{@"x": @(centerX), @"y": @(centerY)},
+                @"width": @(mouthWidth),
+                @"height": @(mouthHeight)
+            };
+        }
+
+        // Extract nose landmark
+        MLKFaceLandmark *noseBase = [face landmarkOfType:MLKFaceLandmarkTypeNoseBase];
+        if (noseBase) {
+            landmarksDict[@"nose"] = @{
+                @"position": @{@"x": @(noseBase.position.x), @"y": @(noseBase.position.y)}
+            };
+        }
+
+        NSDictionary *landmarks = [landmarksDict copy];
 
         // Build face object
         NSMutableDictionary *faceDict = [@{
@@ -442,12 +471,23 @@
                      eyeSide:(NSString *)eyeSide
                   trackingId:(NSInteger)trackingId
             normalizedBounds:(CGRect)normalizedBounds
-                      bounds:(NSDictionary *)bounds {
+                      bounds:(NSDictionary *)bounds
+                        face:(MLKFace *)face
+                landmarkType:(MLKFaceLandmarkType)landmarkType {
+
+    // Extract eye landmark position from ML Kit
+    CGFloat eyeX = 0;
+    CGFloat eyeY = 0;
+    MLKFaceLandmark *eyeLandmark = [face landmarkOfType:landmarkType];
+    if (eyeLandmark && eyeLandmark.position) {
+        eyeX = eyeLandmark.position.x;
+        eyeY = eyeLandmark.position.y;
+    }
 
     // Handle missing probability (returns negative value when unavailable)
     if (openProbability < 0) {
         return @{
-            @"position": @{@"x": @0, @"y": @0},
+            @"position": @{@"x": @(eyeX), @"y": @(eyeY)},
             @"isOpen": @(eyeState.isOpen),
             @"openProbability": @(eyeState.currentProbability),
             @"blinkCount": @(eyeState.blinkCount)
@@ -520,7 +560,7 @@
     }
 
     return @{
-        @"position": @{@"x": @0, @"y": @0},
+        @"position": @{@"x": @(eyeX), @"y": @(eyeY)},
         @"isOpen": @(eyeState.isOpen),
         @"openProbability": @(openProbability),
         @"blinkCount": @(eyeState.blinkCount)
