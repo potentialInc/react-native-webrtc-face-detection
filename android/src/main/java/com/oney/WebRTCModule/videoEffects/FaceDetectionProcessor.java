@@ -3,6 +3,7 @@ package com.oney.WebRTCModule.videoEffects;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
+import android.graphics.Matrix;
 import android.graphics.Rect;
 import android.graphics.YuvImage;
 import android.os.Handler;
@@ -65,12 +66,14 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
     private byte[] lastNv21Data = null;
     private int lastFrameWidth = 0;
     private int lastFrameHeight = 0;
+    private int lastFrameRotation = 0;
 
     // Closed-eye frame storage (for capturing at correct moment)
     private byte[] closedEyeNv21Data = null;
     private int closedEyeFrameWidth = 0;
     private int closedEyeFrameHeight = 0;
     private Rect closedEyeFaceBounds = null;
+    private int closedEyeFrameRotation = 0;
 
     // Dedicated face detection pipeline
     private HandlerThread faceDetectionThread;
@@ -189,6 +192,8 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
         leftEyeStates.clear();
         rightEyeStates.clear();
         frameCounter = 0;
+        lastFrameRotation = 0;
+        closedEyeFrameRotation = 0;
     }
 
     @Override
@@ -420,6 +425,7 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
                 lastNv21Data = nv21.clone();
                 lastFrameWidth = width;
                 lastFrameHeight = height;
+                lastFrameRotation = rotation;
             }
 
             return InputImage.fromByteArray(
@@ -480,7 +486,36 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
                     face.getTrackingId(), rightEyeStates, "right", faceBounds
             );
             landmarks.putMap("rightEye", rightEyeData);
-            
+
+            // Extract mouth landmarks
+            FaceLandmark mouthBottom = face.getLandmark(FaceLandmark.MOUTH_BOTTOM);
+            FaceLandmark mouthLeft = face.getLandmark(FaceLandmark.MOUTH_LEFT);
+            FaceLandmark mouthRight = face.getLandmark(FaceLandmark.MOUTH_RIGHT);
+            if (mouthBottom != null && mouthLeft != null && mouthRight != null) {
+                WritableMap mouthData = Arguments.createMap();
+                WritableMap mouthPosition = Arguments.createMap();
+                float centerX = (mouthLeft.getPosition().x + mouthRight.getPosition().x) / 2.0f;
+                float centerY = mouthBottom.getPosition().y;
+                mouthPosition.putDouble("x", centerX);
+                mouthPosition.putDouble("y", centerY);
+                mouthData.putMap("position", mouthPosition);
+                float mouthWidth = Math.abs(mouthRight.getPosition().x - mouthLeft.getPosition().x);
+                mouthData.putDouble("width", mouthWidth);
+                mouthData.putDouble("height", mouthWidth * 0.5);
+                landmarks.putMap("mouth", mouthData);
+            }
+
+            // Extract nose landmark
+            FaceLandmark noseBase = face.getLandmark(FaceLandmark.NOSE_BASE);
+            if (noseBase != null) {
+                WritableMap noseData = Arguments.createMap();
+                WritableMap nosePosition = Arguments.createMap();
+                nosePosition.putDouble("x", noseBase.getPosition().x);
+                nosePosition.putDouble("y", noseBase.getPosition().y);
+                noseData.putMap("position", nosePosition);
+                landmarks.putMap("nose", noseData);
+            }
+
             faceMap.putMap("landmarks", landmarks);
             facesArray.pushMap(faceMap);
         }
@@ -527,6 +562,7 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
                     closedEyeNv21Data = lastNv21Data.clone();
                     closedEyeFrameWidth = lastFrameWidth;
                     closedEyeFrameHeight = lastFrameHeight;
+                    closedEyeFrameRotation = lastFrameRotation;
                     closedEyeFaceBounds = new Rect(faceBounds);
                 }
             }
@@ -548,10 +584,12 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
                     byte[] savedNv21 = lastNv21Data;
                     int savedWidth = lastFrameWidth;
                     int savedHeight = lastFrameHeight;
+                    int savedRotation = lastFrameRotation;
 
                     lastNv21Data = closedEyeNv21Data;
                     lastFrameWidth = closedEyeFrameWidth;
                     lastFrameHeight = closedEyeFrameHeight;
+                    lastFrameRotation = closedEyeFrameRotation;
 
                     String base64Image = captureFrameAsBase64(closedEyeFaceBounds);
 
@@ -559,6 +597,7 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
                     lastNv21Data = savedNv21;
                     lastFrameWidth = savedWidth;
                     lastFrameHeight = savedHeight;
+                    lastFrameRotation = savedRotation;
 
                     if (base64Image != null) {
                         blinkEvent.putString("faceImage", base64Image);
@@ -642,6 +681,20 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
                 resultBitmap = scaledBitmap;
             }
 
+            // Apply frame rotation to correct image orientation
+            if (lastFrameRotation != 0) {
+                Matrix matrix = new Matrix();
+                matrix.postRotate(lastFrameRotation);
+                Bitmap rotatedBitmap = Bitmap.createBitmap(
+                    resultBitmap, 0, 0,
+                    resultBitmap.getWidth(), resultBitmap.getHeight(),
+                    matrix, true);
+                if (rotatedBitmap != resultBitmap) {
+                    resultBitmap.recycle();
+                }
+                resultBitmap = rotatedBitmap;
+            }
+
             // Encode to JPEG base64
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             resultBitmap.compress(Bitmap.CompressFormat.JPEG, (int)(imageQuality * 100), baos);
@@ -700,12 +753,14 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
         lastNv21Data = null;
         lastFrameWidth = 0;
         lastFrameHeight = 0;
+        lastFrameRotation = 0;
 
         // Clear closed-eye frame data
         closedEyeNv21Data = null;
         closedEyeFrameWidth = 0;
         closedEyeFrameHeight = 0;
         closedEyeFaceBounds = null;
+        closedEyeFrameRotation = 0;
 
         Log.d(TAG, "Face detection pipeline cleaned up");
     }

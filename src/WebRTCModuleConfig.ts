@@ -8,7 +8,7 @@ export interface WebRTCConfig {
      * @default true
      */
     enableScreenCapture?: boolean;
-    
+
     /**
      * Enable face detection functionality
      * When disabled, face detection methods will throw an error
@@ -27,15 +27,15 @@ const globalConfig: Required<WebRTCConfig> = {
 
 /**
  * Configure the WebRTC module with optional features
- * 
+ *
  * This should be called early in your application, before using any WebRTC features.
- * 
+ *
  * @param config Configuration options
- * 
+ *
  * @example
  * ```tsx
  * import { configureWebRTC } from 'react-native-webrtc';
- * 
+ *
  * // At app startup
  * configureWebRTC({
  *   enableScreenCapture: false,  // Disable screen capture to reduce bundle size
@@ -47,7 +47,7 @@ export function configureWebRTC(config: WebRTCConfig): void {
     if (typeof config.enableScreenCapture === 'boolean') {
         globalConfig.enableScreenCapture = config.enableScreenCapture;
     }
-    
+
     if (typeof config.enableFaceDetection === 'boolean') {
         globalConfig.enableFaceDetection = config.enableFaceDetection;
     }

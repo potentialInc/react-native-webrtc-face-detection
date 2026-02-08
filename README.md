@@ -39,6 +39,12 @@ This fork extends the original react-native-webrtc with powerful face detection 
 - Yaw, pitch, and roll angles
 - Head orientation tracking for advanced use cases
 
+### 🎨 Face Detection Overlay
+- **Animated bounding boxes** around face, eyes, and mouth
+- Real-time **head pose** and **eye status** labels
+- **Fully customizable**: colors, sizes, border radii, shapes
+- Coordinate mapping with **mirror** and **objectFit** support
+
 ## Feature Overview
 
 |  | Android | iOS | tvOS | macOS* | Expo* |
@@ -50,6 +56,7 @@ This fork extends the original react-native-webrtc with powerful face detection 
 | **Eye Tracking** | ✅ | ✅ | - | - | ✅ |
 | **Blink Detection** | ✅ | ✅ | - | - | ✅ |
 | **Frame Capture** | ✅ | ✅ | - | - | ✅ |
+| **Face Overlay** | ✅ | ✅ | - | - | ✅ |
 | Unified Plan | ✅ | ✅ | - | - | ✅ |
 | Simulcast | ✅ | ✅ | - | - | ✅ |
 
@@ -332,6 +339,78 @@ function VideoCallWithFaceDetection() {
 }
 ```
 
+### Face Detection Overlay
+
+`FaceDetectionOverlay` is a pure UI component — it does **not** require any separate enable step. Just pass the `detectionResult` from `useFaceDetection` and it renders animated bounding boxes. The underlying face detection pipeline (`configureWebRTC` + `useFaceDetection`) must be active to provide the data.
+
+```typescript
+import {
+  RTCView,
+  useFaceDetection,
+  FaceDetectionOverlay,
+  mediaDevices,
+  configureWebRTC,
+} from 'react-native-webrtc-face-detection';
+
+configureWebRTC({ enableFaceDetection: true });
+
+function FaceOverlayExample() {
+  const [stream, setStream] = useState(null);
+  const videoTrack = stream?.getVideoTracks()[0] ?? null;
+  const { detectionResult, enable } = useFaceDetection(videoTrack);
+
+  useEffect(() => {
+    mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
+      .then(setStream);
+  }, []);
+
+  useEffect(() => { if (videoTrack) enable(); }, [videoTrack]);
+
+  return (
+    <View style={{ flex: 1 }}>
+      {stream && (
+        <View style={{ position: 'relative' }}>
+          <RTCView
+            streamURL={stream.toURL()}
+            style={{ width: '100%', aspectRatio: 4 / 3 }}
+            objectFit="cover"
+            mirror={true}
+          />
+          {detectionResult && (
+            <FaceDetectionOverlay
+              detectionResult={detectionResult}
+              mirror={true}
+              objectFit="cover"
+              config={{
+                showFaceBox: true,
+                showEyeBoxes: true,
+                showMouthBox: true,
+                showHeadPose: true,
+                showEyeStatus: true,
+                // Customize appearance
+                faceBoxColor: '#00FF00',
+                eyeBoxColor: '#00AAFF',
+                eyeClosedColor: '#FF4444',
+                mouthBoxColor: '#FF00FF',
+                strokeWidth: 2,
+                eyeBoxSize: 30,
+                eyeBoxBorderRadius: 2,    // Use eyeBoxSize/2 for circles
+                faceBoxBorderRadius: 4,
+                mouthBoxBorderRadius: 2,
+              }}
+              style={{
+                position: 'absolute',
+                top: 0, left: 0, right: 0, bottom: 0,
+              }}
+            />
+          )}
+        </View>
+      )}
+    </View>
+  );
+}
+```
+
 ## 📚 Documentation
 
 - [Android Installation](./Documentation/AndroidInstallation.md)
@@ -379,6 +458,18 @@ interface BoundingBox {
 interface FaceLandmarks {
   leftEye: EyeData;
   rightEye: EyeData;
+  mouth?: MouthData;
+  nose?: NoseData;
+}
+
+interface MouthData {
+  position: { x: number; y: number };
+  width: number;
+  height: number;
+}
+
+interface NoseData {
+  position: { x: number; y: number };
 }
 
 interface EyeData {
@@ -409,6 +500,27 @@ interface FaceDetectionResult {
   frameWidth: number;
   frameHeight: number;
 }
+
+interface FaceDetectionOverlayConfig {
+  showFaceBox?: boolean;          // default: true
+  showEyeBoxes?: boolean;         // default: true
+  showMouthBox?: boolean;         // default: true
+  showHeadPose?: boolean;         // default: false
+  showEyeStatus?: boolean;        // default: false
+  faceBoxColor?: string;          // default: '#00FF00'
+  eyeBoxColor?: string;           // default: '#00AAFF'
+  eyeClosedColor?: string;        // default: '#FF4444'
+  mouthBoxColor?: string;         // default: '#FF00FF'
+  strokeWidth?: number;           // default: 2
+  animationDuration?: number;     // default: 100 (ms)
+  labelColor?: string;            // default: '#FFFFFF'
+  labelFontSize?: number;         // default: 10
+  labelBackgroundColor?: string;  // default: 'rgba(0, 0, 0, 0.6)'
+  eyeBoxSize?: number;            // default: 30
+  eyeBoxBorderRadius?: number;    // default: 2
+  faceBoxBorderRadius?: number;   // default: 4
+  mouthBoxBorderRadius?: number;  // default: 2
+}
 ```
 
 ### Hooks
@@ -424,6 +536,7 @@ interface FaceDetectionResult {
 |-----------|-------------|
 | `RTCView` | Video rendering component |
 | `RTCPIPView` | Picture-in-Picture video view |
+| `FaceDetectionOverlay` | Animated face/eye/mouth bounding box overlay |
 | `ScreenCapturePickerView` | Screen capture picker (iOS) |
 
 ## 📁 Example Projects
@@ -448,7 +561,9 @@ This project is a fork of [react-native-webrtc](https://github.com/react-native-
 - Blink detection with React hooks
 - **Frame capture on blink** with face cropping
 - Head pose estimation
+- Mouth and nose landmark detection
 - `useFaceDetection` and `useBlinkDetection` hooks
+- `FaceDetectionOverlay` component with fully customizable appearance
 - Face detection processor architecture for Android and iOS
 
 ## 📄 License

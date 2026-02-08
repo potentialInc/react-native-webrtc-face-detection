@@ -1,9 +1,9 @@
 import { EventTarget, Event, defineEventAttribute } from 'event-target-shim/index';
 import { NativeModules } from 'react-native';
 
+import { isFeatureEnabled } from './WebRTCModuleConfig';
 import getDisplayMedia from './getDisplayMedia';
 import getUserMedia, { Constraints } from './getUserMedia';
-import { isFeatureEnabled } from './WebRTCModuleConfig';
 
 const { WebRTCModule } = NativeModules;
 
@@ -33,6 +33,7 @@ class MediaDevices extends EventTarget<MediaDevicesEventMap> {
                 'Screen capture is disabled. Enable it by calling configureWebRTC({ enableScreenCapture: true })'
             ));
         }
+
         return getDisplayMedia();
     }
 

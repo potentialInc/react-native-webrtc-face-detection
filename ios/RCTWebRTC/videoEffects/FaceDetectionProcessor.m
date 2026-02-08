@@ -43,6 +43,9 @@
 @property (nonatomic, assign) CVPixelBufferRef closedEyePixelBuffer;
 @property (nonatomic, assign) CGSize closedEyeFrameSize;
 @property (nonatomic, assign) CGRect closedEyeFaceBounds;
+// Frame rotation tracking
+@property (nonatomic, assign) RTCVideoRotation currentFrameRotation;
+@property (nonatomic, assign) RTCVideoRotation closedEyeFrameRotation;
 // I420 to BGRA conversion
 @property (nonatomic, strong) I420Converter *i420Converter;
 @end
@@ -71,6 +74,8 @@
         _closedEyePixelBuffer = NULL;
         _closedEyeFrameSize = CGSizeZero;
         _closedEyeFaceBounds = CGRectZero;
+        _currentFrameRotation = RTCVideoRotation_0;
+        _closedEyeFrameRotation = RTCVideoRotation_0;
 
         [self initializeFaceDetector];
     }
@@ -106,6 +111,8 @@
         }
         _closedEyeFrameSize = CGSizeZero;
         _closedEyeFaceBounds = CGRectZero;
+        _currentFrameRotation = RTCVideoRotation_0;
+        _closedEyeFrameRotation = RTCVideoRotation_0;
     }
 }
 
@@ -141,11 +148,13 @@
     int32_t frameWidth = frame.width;
     int32_t frameHeight = frame.height;
     int64_t timestamp = frame.timeStampNs;
+    RTCVideoRotation frameRotation = frame.rotation;
 
     dispatch_async(_processingQueue, ^{
         [self processFrameWithPixelBuffer:pixelBuffer
                                     width:frameWidth
                                    height:frameHeight
+                                 rotation:frameRotation
                                 timestamp:timestamp];
         CVPixelBufferRelease(pixelBuffer);
     });
@@ -156,6 +165,7 @@
 - (void)processFrameWithPixelBuffer:(CVPixelBufferRef)pixelBuffer
                               width:(int32_t)frameWidth
                              height:(int32_t)frameHeight
+                           rotation:(RTCVideoRotation)frameRotation
                           timestamp:(int64_t)timestamp {
     @autoreleasepool {
         // Validate pixel buffer has actual image data
@@ -188,6 +198,7 @@
             CVPixelBufferRetain(pixelBuffer);
             _currentPixelBuffer = pixelBuffer;
             _currentFrameSize = CGSizeMake(frameWidth, frameHeight);
+            _currentFrameRotation = frameRotation;
         }
 
         // Ensure face detector is initialized
@@ -221,7 +232,24 @@
         @try {
             // Create ML Kit vision image from UIImage
             MLKVisionImage *visionImage = [[MLKVisionImage alloc] initWithImage:uiImage];
-            visionImage.orientation = UIImageOrientationRight;
+            // Map WebRTC frame rotation to UIImageOrientation for ML Kit
+            UIImageOrientation mlKitOrientation;
+            switch (frameRotation) {
+                case RTCVideoRotation_90:
+                    mlKitOrientation = UIImageOrientationRight;
+                    break;
+                case RTCVideoRotation_180:
+                    mlKitOrientation = UIImageOrientationDown;
+                    break;
+                case RTCVideoRotation_270:
+                    mlKitOrientation = UIImageOrientationLeft;
+                    break;
+                case RTCVideoRotation_0:
+                default:
+                    mlKitOrientation = UIImageOrientationUp;
+                    break;
+            }
+            visionImage.orientation = mlKitOrientation;
 
             NSError *error = nil;
             NSArray<MLKFace *> *faces = [self.faceDetector resultsInImage:visionImage error:&error];
@@ -363,19 +391,48 @@
                                              eyeSide:@"left"
                                           trackingId:trackingId
                                     normalizedBounds:normalizedBounds
-                                              bounds:bounds];
+                                              bounds:bounds
+                                                face:face
+                                        landmarkType:MLKFaceLandmarkTypeLeftEye];
 
         NSDictionary *rightEyeData = [self processEye:face.rightEyeOpenProbability
                                              eyeState:rightEyeState
                                               eyeSide:@"right"
                                            trackingId:trackingId
                                      normalizedBounds:normalizedBounds
-                                               bounds:bounds];
+                                               bounds:bounds
+                                                 face:face
+                                         landmarkType:MLKFaceLandmarkTypeRightEye];
 
-        NSDictionary *landmarks = @{
-            @"leftEye": leftEyeData,
-            @"rightEye": rightEyeData
-        };
+        // Extract mouth landmarks
+        NSMutableDictionary *landmarksDict = [NSMutableDictionary dictionary];
+        landmarksDict[@"leftEye"] = leftEyeData;
+        landmarksDict[@"rightEye"] = rightEyeData;
+
+        MLKFaceLandmark *mouthBottom = [face landmarkOfType:MLKFaceLandmarkTypeMouthBottom];
+        MLKFaceLandmark *mouthLeft = [face landmarkOfType:MLKFaceLandmarkTypeMouthLeft];
+        MLKFaceLandmark *mouthRight = [face landmarkOfType:MLKFaceLandmarkTypeMouthRight];
+        if (mouthBottom && mouthLeft && mouthRight) {
+            CGFloat centerX = (mouthLeft.position.x + mouthRight.position.x) / 2.0;
+            CGFloat centerY = mouthBottom.position.y;
+            CGFloat mouthWidth = fabs(mouthRight.position.x - mouthLeft.position.x);
+            CGFloat mouthHeight = mouthWidth * 0.5;
+            landmarksDict[@"mouth"] = @{
+                @"position": @{@"x": @(centerX), @"y": @(centerY)},
+                @"width": @(mouthWidth),
+                @"height": @(mouthHeight)
+            };
+        }
+
+        // Extract nose landmark
+        MLKFaceLandmark *noseBase = [face landmarkOfType:MLKFaceLandmarkTypeNoseBase];
+        if (noseBase) {
+            landmarksDict[@"nose"] = @{
+                @"position": @{@"x": @(noseBase.position.x), @"y": @(noseBase.position.y)}
+            };
+        }
+
+        NSDictionary *landmarks = [landmarksDict copy];
 
         // Build face object
         NSMutableDictionary *faceDict = [@{
@@ -414,12 +471,23 @@
                      eyeSide:(NSString *)eyeSide
                   trackingId:(NSInteger)trackingId
             normalizedBounds:(CGRect)normalizedBounds
-                      bounds:(NSDictionary *)bounds {
+                      bounds:(NSDictionary *)bounds
+                        face:(MLKFace *)face
+                landmarkType:(MLKFaceLandmarkType)landmarkType {
+
+    // Extract eye landmark position from ML Kit
+    CGFloat eyeX = 0;
+    CGFloat eyeY = 0;
+    MLKFaceLandmark *eyeLandmark = [face landmarkOfType:landmarkType];
+    if (eyeLandmark && eyeLandmark.position) {
+        eyeX = eyeLandmark.position.x;
+        eyeY = eyeLandmark.position.y;
+    }
 
     // Handle missing probability (returns negative value when unavailable)
     if (openProbability < 0) {
         return @{
-            @"position": @{@"x": @0, @"y": @0},
+            @"position": @{@"x": @(eyeX), @"y": @(eyeY)},
             @"isOpen": @(eyeState.isOpen),
             @"openProbability": @(eyeState.currentProbability),
             @"blinkCount": @(eyeState.blinkCount)
@@ -448,6 +516,7 @@
             _closedEyePixelBuffer = _currentPixelBuffer;
             _closedEyeFrameSize = _currentFrameSize;
             _closedEyeFaceBounds = normalizedBounds;
+            _closedEyeFrameRotation = _currentFrameRotation;
         }
     }
 
@@ -469,7 +538,8 @@
             if (_captureOnBlink && _closedEyePixelBuffer) {
                 NSString *base64Image = [self captureFrameAsBase64FromBuffer:_closedEyePixelBuffer
                                                                        size:_closedEyeFrameSize
-                                                                 faceBounds:_closedEyeFaceBounds];
+                                                                 faceBounds:_closedEyeFaceBounds
+                                                                   rotation:_closedEyeFrameRotation];
 
                 if (base64Image) {
                     blinkBody[@"faceImage"] = base64Image;
@@ -490,7 +560,7 @@
     }
 
     return @{
-        @"position": @{@"x": @0, @"y": @0},
+        @"position": @{@"x": @(eyeX), @"y": @(eyeY)},
         @"isOpen": @(eyeState.isOpen),
         @"openProbability": @(openProbability),
         @"blinkCount": @(eyeState.blinkCount)
@@ -502,12 +572,14 @@
 - (NSString *)captureFrameAsBase64WithFaceBounds:(CGRect)normalizedBounds {
     return [self captureFrameAsBase64FromBuffer:_currentPixelBuffer
                                            size:_currentFrameSize
-                                    faceBounds:normalizedBounds];
+                                    faceBounds:normalizedBounds
+                                      rotation:_currentFrameRotation];
 }
 
 - (NSString *)captureFrameAsBase64FromBuffer:(CVPixelBufferRef)pixelBuffer
                                         size:(CGSize)frameSize
-                                  faceBounds:(CGRect)normalizedBounds {
+                                  faceBounds:(CGRect)normalizedBounds
+                                    rotation:(RTCVideoRotation)rotation {
     if (!pixelBuffer) return nil;
 
     // Lock buffer for ENTIRE conversion process (CIImage is lazy - reads data on createCGImage)
@@ -557,7 +629,24 @@
 
     if (!cgImage) return nil;
 
-    UIImage *image = [UIImage imageWithCGImage:cgImage];
+    // Map WebRTC frame rotation to UIImageOrientation for correct JPEG encoding
+    UIImageOrientation imageOrientation;
+    switch (rotation) {
+        case RTCVideoRotation_90:
+            imageOrientation = UIImageOrientationRight;
+            break;
+        case RTCVideoRotation_180:
+            imageOrientation = UIImageOrientationDown;
+            break;
+        case RTCVideoRotation_270:
+            imageOrientation = UIImageOrientationLeft;
+            break;
+        case RTCVideoRotation_0:
+        default:
+            imageOrientation = UIImageOrientationUp;
+            break;
+    }
+    UIImage *image = [UIImage imageWithCGImage:cgImage scale:1.0 orientation:imageOrientation];
     CGImageRelease(cgImage);
 
     NSData *jpegData = UIImageJPEGRepresentation(image, _imageQuality);

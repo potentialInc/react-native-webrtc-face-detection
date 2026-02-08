@@ -7,6 +7,7 @@ import {
   MediaStreamTrack,
   useFaceDetection,
   useBlinkDetection,
+  FaceDetectionOverlay,
 } from 'react-native-webrtc';
 import { Button } from '@/components/Button';
 import { Card } from '@/components/Card';
@@ -121,10 +122,20 @@ export default function FaceDetectionScreen() {
               mirror={true}
             />
             {/* Face detection overlay */}
-            {faceDetectionEnabled && facesDetected > 0 && (
-              <View style={styles.faceOverlay}>
-                <Text style={styles.faceCount}>{facesDetected} face{facesDetected > 1 ? 's' : ''}</Text>
-              </View>
+            {faceDetectionEnabled && detectionResult && (
+              <FaceDetectionOverlay
+                detectionResult={detectionResult}
+                mirror={true}
+                objectFit="cover"
+                config={{
+                  showFaceBox: true,
+                  showEyeBoxes: true,
+                  showMouthBox: true,
+                  showHeadPose: true,
+                  showEyeStatus: true,
+                }}
+                style={styles.detectionOverlay}
+              />
             )}
           </View>
         ) : (
@@ -341,19 +352,14 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
     borderRadius: borderRadius.lg,
   },
-  faceOverlay: {
+  detectionOverlay: {
     position: 'absolute',
-    top: spacing.md,
-    right: spacing.md,
-    backgroundColor: 'rgba(0, 217, 255, 0.9)',
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.xs,
-    borderRadius: borderRadius.md,
-  },
-  faceCount: {
-    color: colors.background,
-    fontSize: 14,
-    fontWeight: '700',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: borderRadius.lg,
+    overflow: 'hidden',
   },
   placeholder: {
     width: '100%',
