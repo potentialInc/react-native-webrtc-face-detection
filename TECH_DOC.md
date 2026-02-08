@@ -1,6 +1,6 @@
 # Technical Documentation: react-native-webrtc-face-detection
 
-**Version:** 124.1.0 | **WebRTC:** M124 (Jitsi) | **ML Kit:** v16.1.6 (Android) / v8.0.0 (iOS)
+**Version:** 124.1.1 | **WebRTC:** M124 (Jitsi) | **ML Kit:** v16.1.6 (Android) / v8.0.0 (iOS)
 
 ---
 

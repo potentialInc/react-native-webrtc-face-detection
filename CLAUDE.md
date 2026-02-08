@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 ## Project
-react-native-webrtc-face-detection (v124.1.0) — React Native WebRTC library with ML Kit-powered face detection, eye tracking, and blink detection on iOS and Android.
+react-native-webrtc-face-detection (v124.1.1) — React Native WebRTC library with ML Kit-powered face detection, eye tracking, and blink detection on iOS and Android.
 
 ## Commands
 - `npm run build` — bob build (outputs commonjs, module, typescript to lib/)
