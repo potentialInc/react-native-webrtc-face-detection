@@ -45,6 +45,13 @@ This fork extends the original react-native-webrtc with powerful face detection 
 - **Fully customizable**: colors, sizes, border radii, shapes
 - Coordinate mapping with **mirror** and **objectFit** support
 
+### 🖼️ Image Adjustment (Standalone Camera)
+- **Real-time exposure, contrast, saturation, and color temperature** controls
+- Works as a **standalone camera viewer** - no WebRTC peer connection needed
+- Efficient **LUT-based I420 pixel processing** with zero overhead at defaults
+- `useImageAdjustment` React hook with individual setters and presets
+- Can run **simultaneously with face detection**
+
 ## Feature Overview
 
 |  | Android | iOS | tvOS | macOS* | Expo* |
@@ -57,6 +64,7 @@ This fork extends the original react-native-webrtc with powerful face detection 
 | **Blink Detection** | ✅ | ✅ | - | - | ✅ |
 | **Frame Capture** | ✅ | ✅ | - | - | ✅ |
 | **Face Overlay** | ✅ | ✅ | - | - | ✅ |
+| **Image Adjustment** | ✅ | ✅ | - | - | ✅ |
 | Unified Plan | ✅ | ✅ | - | - | ✅ |
 | Simulcast | ✅ | ✅ | - | - | ✅ |
 
@@ -339,6 +347,52 @@ function VideoCallWithFaceDetection() {
 }
 ```
 
+### Standalone Camera with Image Adjustment
+
+Use the camera as a standalone viewer with real-time image controls - no WebRTC peer connection needed:
+
+```typescript
+import { useState, useEffect } from 'react';
+import { View } from 'react-native';
+import {
+  mediaDevices,
+  RTCView,
+  useImageAdjustment,
+} from 'react-native-webrtc-face-detection';
+
+function CameraWithAdjustments() {
+  const [stream, setStream] = useState(null);
+  const videoTrack = stream?.getVideoTracks()[0] ?? null;
+
+  const {
+    enable,
+    setExposure,
+    setContrast,
+    setSaturation,
+    setColorTemperature,
+  } = useImageAdjustment(videoTrack);
+
+  useEffect(() => {
+    mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
+      .then(setStream);
+    return () => stream?.release();
+  }, []);
+
+  useEffect(() => {
+    if (videoTrack) enable();
+  }, [videoTrack]);
+
+  return (
+    <View style={{ flex: 1 }}>
+      {stream && (
+        <RTCView streamURL={stream.toURL()} style={{ flex: 1 }} mirror={true} />
+      )}
+      {/* Connect sliders to setExposure, setContrast, setSaturation, setColorTemperature */}
+    </View>
+  );
+}
+```
+
 ### Face Detection Overlay
 
 `FaceDetectionOverlay` is a pure UI component — it does **not** require any separate enable step. Just pass the `detectionResult` from `useFaceDetection` and it renders animated bounding boxes. The underlying face detection pipeline (`configureWebRTC` + `useFaceDetection`) must be active to provide the data.
@@ -418,6 +472,7 @@ function FaceOverlayExample() {
 - [tvOS Installation](./Documentation/tvOSInstallation.md)
 - [Basic Usage](./Documentation/BasicUsage.md)
 - [Face Detection Guide](./Documentation/FaceDetection.md)
+- [Image Adjustment Guide](./Documentation/ImageAdjustment.md)
 - [Step by Step Call Guide](./Documentation/CallGuide.md)
 - [Improving Call Reliability](./Documentation/ImprovingCallReliability.md)
 
@@ -426,6 +481,14 @@ function FaceOverlayExample() {
 ### Configuration
 
 ```typescript
+// Image adjustment options
+interface ImageAdjustmentConfig {
+  exposure?: number;         // -1.0 to 1.0 (default: 0.0)
+  contrast?: number;         // 0.0 to 3.0 (default: 1.0)
+  saturation?: number;       // 0.0 to 3.0 (default: 1.0)
+  colorTemperature?: number; // -1.0 to 1.0 (default: 0.0)
+}
+
 // Face detection options (passed to hooks)
 interface FaceDetectionConfig {
   frameSkipCount?: number;    // Process every Nth frame (default: 3)
@@ -529,6 +592,7 @@ interface FaceDetectionOverlayConfig {
 |------|-------------|
 | `useFaceDetection` | Returns detected faces and detection state |
 | `useBlinkDetection` | Tracks blinks with configurable callbacks |
+| `useImageAdjustment` | Controls exposure, contrast, saturation, color temperature |
 
 ### Components
 
@@ -565,6 +629,9 @@ This project is a fork of [react-native-webrtc](https://github.com/react-native-
 - `useFaceDetection` and `useBlinkDetection` hooks
 - `FaceDetectionOverlay` component with fully customizable appearance
 - Face detection processor architecture for Android and iOS
+- Real-time image adjustment (exposure, contrast, saturation, color temperature)
+- `useImageAdjustment` hook for standalone camera control
+- LUT-based I420 video frame processing with zero overhead at defaults
 
 ## 📄 License
 

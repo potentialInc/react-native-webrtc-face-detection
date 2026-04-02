@@ -4,6 +4,7 @@ import { NativeModules } from 'react-native';
 import { MediaTrackConstraints } from './Constraints';
 import { addListener, removeListener } from './EventEmitter';
 import { FaceDetectionConfig, FaceDetectionResult, BlinkEvent } from './FaceDetection.types';
+import { ImageAdjustmentConfig } from './ImageAdjustment.types';
 import Logger from './Logger';
 import { deepClone, normalizeConstraints } from './RTCUtil';
 import { isFeatureEnabled } from './WebRTCModuleConfig';
@@ -58,6 +59,8 @@ export default class MediaStreamTrack extends EventTarget<MediaStreamTrackEventM
     _peerConnectionId: number;
     _readyState: MediaStreamTrackState;
     _faceDetectionEnabled = false;
+    _imageAdjustmentEnabled = false;
+    _activeEffects: Set<string> = new Set();
 
     readonly id: string;
     readonly kind: string;
@@ -259,8 +262,9 @@ export default class MediaStreamTrack extends EventTarget<MediaStreamTrackEventM
         await WebRTCModule.enableFaceDetection(this.id, config || {});
         this._faceDetectionEnabled = true;
 
-        // Set up the video effect if not already applied
-        this._setVideoEffect('faceDetection');
+        // Add to active effects and apply
+        this._activeEffects.add('faceDetection');
+        this._setVideoEffects(Array.from(this._activeEffects));
     }
 
     /**
@@ -280,8 +284,9 @@ export default class MediaStreamTrack extends EventTarget<MediaStreamTrackEventM
         await WebRTCModule.disableFaceDetection(this.id);
         this._faceDetectionEnabled = false;
 
-        // Remove the video effect
-        this._setVideoEffects([]);
+        // Remove from active effects and apply remaining
+        this._activeEffects.delete('faceDetection');
+        this._setVideoEffects(Array.from(this._activeEffects));
     }
 
     /**
@@ -289,6 +294,76 @@ export default class MediaStreamTrack extends EventTarget<MediaStreamTrackEventM
      */
     get isFaceDetectionEnabled(): boolean {
         return this._faceDetectionEnabled;
+    }
+
+    /**
+     * Enable image adjustment for this video track
+     *
+     * @param config Optional configuration for image adjustments
+     * @returns Promise that resolves when image adjustment is enabled
+     */
+    async enableImageAdjustment(config?: Partial<ImageAdjustmentConfig>): Promise<void> {
+        if (this.kind !== 'video') {
+            throw new Error('Image adjustment is only available for video tracks');
+        }
+
+        if (this.remote) {
+            throw new Error('Image adjustment is not supported for remote tracks');
+        }
+
+        await WebRTCModule.enableImageAdjustment(this.id, config || {});
+        this._imageAdjustmentEnabled = true;
+
+        // Add to active effects and apply
+        this._activeEffects.add('imageAdjustment');
+        this._setVideoEffects(Array.from(this._activeEffects));
+    }
+
+    /**
+     * Update image adjustment configuration without re-enabling
+     *
+     * @param config Configuration values to update
+     * @returns Promise that resolves when the update is applied
+     */
+    async updateImageAdjustment(config: Partial<ImageAdjustmentConfig>): Promise<void> {
+        if (this.kind !== 'video') {
+            throw new Error('Image adjustment is only available for video tracks');
+        }
+
+        if (!this._imageAdjustmentEnabled) {
+            throw new Error('Image adjustment is not enabled');
+        }
+
+        await WebRTCModule.updateImageAdjustment(this.id, config);
+    }
+
+    /**
+     * Disable image adjustment for this video track
+     *
+     * @returns Promise that resolves when image adjustment is disabled
+     */
+    async disableImageAdjustment(): Promise<void> {
+        if (this.kind !== 'video') {
+            throw new Error('Image adjustment is only available for video tracks');
+        }
+
+        if (!this._imageAdjustmentEnabled) {
+            return;
+        }
+
+        await WebRTCModule.disableImageAdjustment(this.id);
+        this._imageAdjustmentEnabled = false;
+
+        // Remove from active effects and apply remaining
+        this._activeEffects.delete('imageAdjustment');
+        this._setVideoEffects(Array.from(this._activeEffects));
+    }
+
+    /**
+     * Check if image adjustment is currently enabled
+     */
+    get isImageAdjustmentEnabled(): boolean {
+        return this._imageAdjustmentEnabled;
     }
 
     release(): void {
@@ -299,6 +374,13 @@ export default class MediaStreamTrack extends EventTarget<MediaStreamTrackEventM
         // Clean up face detection if enabled
         if (this._faceDetectionEnabled) {
             this.disableFaceDetection().catch(() => {
+                // Ignore errors during cleanup
+            });
+        }
+
+        // Clean up image adjustment if enabled
+        if (this._imageAdjustmentEnabled) {
+            this.disableImageAdjustment().catch(() => {
                 // Ignore errors during cleanup
             });
         }

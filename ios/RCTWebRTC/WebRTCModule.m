@@ -12,9 +12,11 @@
 #import "WebRTCModuleOptions.h"
 #import "videoEffects/ProcessorProvider.h"
 #import "videoEffects/FaceDetectionProcessor.h"
+#import "videoEffects/ImageAdjustmentProcessor.h"
 
 @interface WebRTCModule ()
 @property (nonatomic, strong) FaceDetectionProcessor *faceDetectionProcessor;
+@property (nonatomic, strong) ImageAdjustmentProcessor *imageAdjustmentProcessor;
 @end
 
 @implementation WebRTCModule
@@ -87,6 +89,10 @@
         // Initialize and register face detection processor
         _faceDetectionProcessor = [[FaceDetectionProcessor alloc] initWithEventEmitter:self];
         [ProcessorProvider addProcessor:_faceDetectionProcessor forName:@"faceDetection"];
+
+        // Initialize and register image adjustment processor
+        _imageAdjustmentProcessor = [[ImageAdjustmentProcessor alloc] init];
+        [ProcessorProvider addProcessor:_imageAdjustmentProcessor forName:@"imageAdjustment"];
     }
 
     return self;
@@ -177,10 +183,58 @@ RCT_EXPORT_METHOD(disableFaceDetection
         reject(@"E_FACE_DETECTION", @"Face detection not initialized", nil);
         return;
     }
-    
+
     self.faceDetectionProcessor.isEnabled = NO;
     [self.faceDetectionProcessor reset];
-    
+
+    resolve(@YES);
+}
+
+#pragma mark - Image Adjustment
+
+RCT_EXPORT_METHOD(enableImageAdjustment
+                  : (NSString *)trackId config
+                  : (NSDictionary *)config resolver
+                  : (RCTPromiseResolveBlock)resolve rejecter
+                  : (RCTPromiseRejectBlock)reject) {
+    if (!self.imageAdjustmentProcessor) {
+        reject(@"E_IMAGE_ADJUSTMENT", @"Image adjustment not initialized", nil);
+        return;
+    }
+
+    self.imageAdjustmentProcessor.isEnabled = YES;
+    [self.imageAdjustmentProcessor updateConfig:config];
+
+    resolve(@YES);
+}
+
+RCT_EXPORT_METHOD(updateImageAdjustment
+                  : (NSString *)trackId config
+                  : (NSDictionary *)config resolver
+                  : (RCTPromiseResolveBlock)resolve rejecter
+                  : (RCTPromiseRejectBlock)reject) {
+    if (!self.imageAdjustmentProcessor) {
+        reject(@"E_IMAGE_ADJUSTMENT", @"Image adjustment not initialized", nil);
+        return;
+    }
+
+    [self.imageAdjustmentProcessor updateConfig:config];
+
+    resolve(@YES);
+}
+
+RCT_EXPORT_METHOD(disableImageAdjustment
+                  : (NSString *)trackId resolver
+                  : (RCTPromiseResolveBlock)resolve rejecter
+                  : (RCTPromiseRejectBlock)reject) {
+    if (!self.imageAdjustmentProcessor) {
+        reject(@"E_IMAGE_ADJUSTMENT", @"Image adjustment not initialized", nil);
+        return;
+    }
+
+    self.imageAdjustmentProcessor.isEnabled = NO;
+    [self.imageAdjustmentProcessor reset];
+
     resolve(@YES);
 }
 

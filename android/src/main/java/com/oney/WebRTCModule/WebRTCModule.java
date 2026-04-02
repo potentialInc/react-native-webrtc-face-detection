@@ -24,6 +24,8 @@ import com.facebook.react.modules.core.DeviceEventManagerModule;
 import com.oney.WebRTCModule.videoEffects.ProcessorProvider;
 import com.oney.WebRTCModule.videoEffects.FaceDetectionProcessor;
 import com.oney.WebRTCModule.videoEffects.FaceDetectionProcessorFactory;
+import com.oney.WebRTCModule.videoEffects.ImageAdjustmentProcessor;
+import com.oney.WebRTCModule.videoEffects.ImageAdjustmentProcessorFactory;
 import com.oney.WebRTCModule.webrtcutils.H264AndSoftwareVideoDecoderFactory;
 import com.oney.WebRTCModule.webrtcutils.H264AndSoftwareVideoEncoderFactory;
 
@@ -54,6 +56,7 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
 
     private final GetUserMediaImpl getUserMediaImpl;
     private FaceDetectionProcessorFactory faceDetectionProcessorFactory;
+    private ImageAdjustmentProcessorFactory imageAdjustmentProcessorFactory;
 
     public WebRTCModule(ReactApplicationContext reactContext) {
         super(reactContext);
@@ -119,6 +122,10 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
         // Initialize and register face detection processor factory
         faceDetectionProcessorFactory = new FaceDetectionProcessorFactory(reactContext);
         ProcessorProvider.addProcessor("faceDetection", faceDetectionProcessorFactory);
+
+        // Initialize and register image adjustment processor factory
+        imageAdjustmentProcessorFactory = new ImageAdjustmentProcessorFactory();
+        ProcessorProvider.addProcessor("imageAdjustment", imageAdjustmentProcessorFactory);
     }
 
     @NonNull
@@ -1483,11 +1490,80 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
         }
     }
     
+    @ReactMethod
+    public void enableImageAdjustment(String trackId, ReadableMap config, Promise promise) {
+        if (imageAdjustmentProcessorFactory == null) {
+            promise.reject("E_IMAGE_ADJUSTMENT", "Image adjustment not initialized");
+            return;
+        }
+
+        try {
+            ImageAdjustmentProcessor processor = imageAdjustmentProcessorFactory.getProcessor();
+            processor.setEnabled(true);
+
+            if (config != null) {
+                float exposure = config.hasKey("exposure") ? (float) config.getDouble("exposure") : 0.0f;
+                float contrast = config.hasKey("contrast") ? (float) config.getDouble("contrast") : 1.0f;
+                float saturation = config.hasKey("saturation") ? (float) config.getDouble("saturation") : 1.0f;
+                float colorTemperature = config.hasKey("colorTemperature") ? (float) config.getDouble("colorTemperature") : 0.0f;
+                processor.updateConfig(exposure, contrast, saturation, colorTemperature);
+            }
+
+            promise.resolve(true);
+        } catch (Exception e) {
+            promise.reject("E_IMAGE_ADJUSTMENT", "Failed to enable image adjustment: " + e.getMessage());
+        }
+    }
+
+    @ReactMethod
+    public void updateImageAdjustment(String trackId, ReadableMap config, Promise promise) {
+        if (imageAdjustmentProcessorFactory == null) {
+            promise.reject("E_IMAGE_ADJUSTMENT", "Image adjustment not initialized");
+            return;
+        }
+
+        try {
+            ImageAdjustmentProcessor processor = imageAdjustmentProcessorFactory.getProcessor();
+
+            if (config != null) {
+                float exposure = config.hasKey("exposure") ? (float) config.getDouble("exposure") : 0.0f;
+                float contrast = config.hasKey("contrast") ? (float) config.getDouble("contrast") : 1.0f;
+                float saturation = config.hasKey("saturation") ? (float) config.getDouble("saturation") : 1.0f;
+                float colorTemperature = config.hasKey("colorTemperature") ? (float) config.getDouble("colorTemperature") : 0.0f;
+                processor.updateConfig(exposure, contrast, saturation, colorTemperature);
+            }
+
+            promise.resolve(true);
+        } catch (Exception e) {
+            promise.reject("E_IMAGE_ADJUSTMENT", "Failed to update image adjustment: " + e.getMessage());
+        }
+    }
+
+    @ReactMethod
+    public void disableImageAdjustment(String trackId, Promise promise) {
+        if (imageAdjustmentProcessorFactory == null) {
+            promise.reject("E_IMAGE_ADJUSTMENT", "Image adjustment not initialized");
+            return;
+        }
+
+        try {
+            ImageAdjustmentProcessor processor = imageAdjustmentProcessorFactory.getProcessor();
+            processor.setEnabled(false);
+            processor.reset();
+            promise.resolve(true);
+        } catch (Exception e) {
+            promise.reject("E_IMAGE_ADJUSTMENT", "Failed to disable image adjustment: " + e.getMessage());
+        }
+    }
+
     @Override
     public void onCatalystInstanceDestroy() {
         super.onCatalystInstanceDestroy();
         if (faceDetectionProcessorFactory != null) {
             faceDetectionProcessorFactory.cleanup();
+        }
+        if (imageAdjustmentProcessorFactory != null) {
+            imageAdjustmentProcessorFactory.cleanup();
         }
     }
 }

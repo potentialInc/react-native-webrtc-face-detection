@@ -22,6 +22,7 @@ import type {
     NoseData,
     FaceDetectionOverlayConfig,
 } from './FaceDetection.types';
+import type { ImageAdjustmentConfig } from './ImageAdjustment.types';
 import Logger from './Logger';
 import mediaDevices from './MediaDevices';
 import MediaStream from './MediaStream';
@@ -43,6 +44,7 @@ import { configureWebRTC, type WebRTCConfig } from './WebRTCModuleConfig';
 import FaceDetectionOverlay from './components/FaceDetectionOverlay';
 import { useBlinkDetection } from './hooks/useBlinkDetection';
 import { useFaceDetection } from './hooks/useFaceDetection';
+import { useImageAdjustment } from './hooks/useImageAdjustment';
 
 Logger.enable(`${Logger.ROOT_PREFIX}:*`);
 
@@ -89,6 +91,9 @@ export {
     type MouthData,
     type NoseData,
     type FaceDetectionOverlayConfig,
+    // Image Adjustment
+    useImageAdjustment,
+    type ImageAdjustmentConfig,
 };
 
 declare const global: any;

@@ -11,6 +11,7 @@ function TabBarIcon({ name, color }: { name: string; color: string }) {
     face: '👤',
     videocall: '📞',
     capture: '📸',
+    adjust: '🎨',
   };
   return <Text style={{ fontSize: 24 }}>{icons[name] || '●'}</Text>;
 }
@@ -79,6 +80,14 @@ export default function RootLayout() {
             title: 'Capture',
             headerTitle: 'Blink Capture',
             tabBarIcon: ({ color }) => <TabBarIcon name="capture" color={color} />,
+          }}
+        />
+        <Tabs.Screen
+          name="image-adjustment"
+          options={{
+            title: 'Adjust',
+            headerTitle: 'Image Adjustment',
+            tabBarIcon: ({ color }) => <TabBarIcon name="adjust" color={color} />,
           }}
         />
       </Tabs>
