@@ -1465,6 +1465,27 @@ public class WebRTCModule extends ReactContextBaseJavaModule {
                 if (config.hasKey("maxImageWidth")) {
                     processor.setMaxImageWidth(config.getInt("maxImageWidth"));
                 }
+                // Blink validation config
+                if (config.hasKey("minBlinkDurationMs")) {
+                    processor.setMinBlinkDurationMs((long) config.getDouble("minBlinkDurationMs"));
+                }
+                if (config.hasKey("maxBlinkDurationMs")) {
+                    processor.setMaxBlinkDurationMs((long) config.getDouble("maxBlinkDurationMs"));
+                }
+                if (config.hasKey("blinkCooldownMs")) {
+                    processor.setBlinkCooldownMs((long) config.getDouble("blinkCooldownMs"));
+                }
+                // Adaptive threshold config
+                if (config.hasKey("adaptiveThreshold")) {
+                    processor.setAdaptiveThreshold(config.getBoolean("adaptiveThreshold"));
+                }
+                if (config.hasKey("calibrationDurationMs")) {
+                    processor.setCalibrationDurationMs((long) config.getDouble("calibrationDurationMs"));
+                }
+                // Start calibration if adaptive threshold is enabled
+                if (config.hasKey("adaptiveThreshold") && config.getBoolean("adaptiveThreshold")) {
+                    processor.startCalibrationIfNeeded();
+                }
             }
 
             promise.resolve(true);

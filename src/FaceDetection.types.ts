@@ -42,6 +42,42 @@ export interface FaceDetectionConfig {
      * @default 480
      */
     maxImageWidth?: number;
+
+    /**
+     * Minimum blink duration in milliseconds to count as a valid blink.
+     * Blinks shorter than this are rejected as noise.
+     * @default 50
+     */
+    minBlinkDurationMs?: number;
+
+    /**
+     * Maximum blink duration in milliseconds to count as a valid blink.
+     * Eye closures longer than this are rejected (e.g., sleeping, yawning).
+     * @default 800
+     */
+    maxBlinkDurationMs?: number;
+
+    /**
+     * Minimum time in milliseconds between consecutive blinks for the same eye.
+     * Prevents rapid-fire false blink sequences from threshold oscillation.
+     * @default 300
+     */
+    blinkCooldownMs?: number;
+
+    /**
+     * Enable adaptive thresholding based on per-user calibration.
+     * When enabled, the system observes the user's open-eye probability baseline
+     * during a calibration period and adjusts the threshold automatically.
+     * @default false
+     */
+    adaptiveThreshold?: boolean;
+
+    /**
+     * Duration of the calibration period in milliseconds when adaptiveThreshold is enabled.
+     * During this period, blinks are not detected while the system learns the baseline.
+     * @default 3000
+     */
+    calibrationDurationMs?: number;
 }
 
 /**
@@ -247,9 +283,11 @@ export interface BlinkEvent {
     timestamp: number;
 
     /**
-     * Which eye blinked (available on some platforms)
+     * Which eye blinked.
+     * 'both' indicates a natural blink (both eyes closed simultaneously).
+     * 'left' or 'right' indicates a wink (single-eye blink).
      */
-    eye?: 'left' | 'right';
+    eye?: 'left' | 'right' | 'both';
 
     /**
      * Face tracking ID associated with this blink
@@ -273,6 +311,29 @@ export interface BlinkEvent {
      * Only present when captureOnBlink config is enabled.
      */
     faceBounds?: BoundingBox;
+
+    /**
+     * Duration of the blink in milliseconds (time eyes were closed).
+     */
+    duration?: number;
+
+    /**
+     * Type of blink: 'blink' for both eyes, 'wink' for single eye.
+     */
+    blinkType?: 'blink' | 'wink';
+
+    /**
+     * Confidence score of the blink detection (0.0 to 1.0).
+     * Higher values indicate more reliable blink detection.
+     * Computed from probability delta, duration, and eye symmetry.
+     */
+    confidence?: number;
+
+    /**
+     * Lowest eye open probability observed during the eye closure.
+     * Lower values indicate a more definitive eye closure.
+     */
+    minOpenProbability?: number;
 }
 
 /**

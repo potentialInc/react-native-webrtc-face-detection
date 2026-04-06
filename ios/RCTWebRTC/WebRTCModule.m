@@ -171,6 +171,27 @@ RCT_EXPORT_METHOD(enableFaceDetection
     if (config[@"maxImageWidth"]) {
         self.faceDetectionProcessor.maxImageWidth = [config[@"maxImageWidth"] integerValue];
     }
+    // Blink validation config
+    if (config[@"minBlinkDurationMs"]) {
+        self.faceDetectionProcessor.minBlinkDurationMs = [config[@"minBlinkDurationMs"] integerValue];
+    }
+    if (config[@"maxBlinkDurationMs"]) {
+        self.faceDetectionProcessor.maxBlinkDurationMs = [config[@"maxBlinkDurationMs"] integerValue];
+    }
+    if (config[@"blinkCooldownMs"]) {
+        self.faceDetectionProcessor.blinkCooldownMs = [config[@"blinkCooldownMs"] integerValue];
+    }
+    // Adaptive threshold config
+    if (config[@"adaptiveThreshold"]) {
+        self.faceDetectionProcessor.adaptiveThreshold = [config[@"adaptiveThreshold"] boolValue];
+    }
+    if (config[@"calibrationDurationMs"]) {
+        self.faceDetectionProcessor.calibrationDurationMs = [config[@"calibrationDurationMs"] integerValue];
+    }
+    // Start calibration if adaptive threshold is enabled
+    if (self.faceDetectionProcessor.adaptiveThreshold) {
+        [self.faceDetectionProcessor startCalibrationIfNeeded];
+    }
 
     resolve(@YES);
 }

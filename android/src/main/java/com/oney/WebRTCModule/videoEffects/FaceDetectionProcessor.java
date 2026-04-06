@@ -54,7 +54,7 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
     private final ReactApplicationContext reactContext;
     private FaceDetector detector;
     private boolean isEnabled = false;
-    private int frameSkipCount = 5; // Process every 5th frame for performance
+    private int frameSkipCount = 3; // Process every 3rd frame (matches iOS and docs)
     private int frameCounter = 0;
     private float blinkThreshold = 0.3f;
 
@@ -75,6 +75,18 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
     private Rect closedEyeFaceBounds = null;
     private int closedEyeFrameRotation = 0;
 
+    // Blink validation configuration
+    private long minBlinkDurationMs = 50;
+    private long maxBlinkDurationMs = 800;
+    private long blinkCooldownMs = 300;
+
+    // Adaptive thresholding
+    private boolean adaptiveThresholdEnabled = false;
+    private long calibrationDurationMs = 3000;
+    private boolean isCalibrating = false;
+    private long calibrationStartTime = 0;
+    private final java.util.ArrayList<Float> calibrationSamples = new java.util.ArrayList<>();
+
     // Dedicated face detection pipeline
     private HandlerThread faceDetectionThread;
     private Handler faceDetectionHandler;
@@ -92,6 +104,10 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
         boolean wasOpen = true;
         int blinkCount = 0;
         float currentProbability = 1.0f;
+        float smoothedProbability = 1.0f;       // EMA smoothed value
+        long closedTimestamp = 0;                // When eye closed (ms)
+        long lastBlinkTimestamp = 0;             // Last blink time (ms) for debounce
+        float minProbDuringClosure = 1.0f;       // Lowest prob while closed
     }
 
     // #region agent log helper
@@ -188,12 +204,74 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
         this.maxImageWidth = width;
     }
 
+    public void setMinBlinkDurationMs(long ms) {
+        this.minBlinkDurationMs = ms;
+    }
+
+    public void setMaxBlinkDurationMs(long ms) {
+        this.maxBlinkDurationMs = ms;
+    }
+
+    public void setBlinkCooldownMs(long ms) {
+        this.blinkCooldownMs = ms;
+    }
+
+    public void setAdaptiveThreshold(boolean enabled) {
+        this.adaptiveThresholdEnabled = enabled;
+    }
+
+    public void setCalibrationDurationMs(long ms) {
+        this.calibrationDurationMs = ms;
+    }
+
+    public void startCalibrationIfNeeded() {
+        if (adaptiveThresholdEnabled && !isCalibrating) {
+            isCalibrating = true;
+            calibrationStartTime = System.currentTimeMillis();
+            calibrationSamples.clear();
+            Log.d(TAG, "Adaptive threshold calibration started");
+        }
+    }
+
+    private void processCalibrationSample(float openProbability) {
+        if (!isCalibrating) return;
+
+        long now = System.currentTimeMillis();
+
+        // Only collect samples that are likely open-eye (> 0.5)
+        if (openProbability > 0.5f) {
+            calibrationSamples.add(openProbability);
+        }
+
+        // Check if calibration period is over
+        if (now - calibrationStartTime >= calibrationDurationMs) {
+            if (!calibrationSamples.isEmpty()) {
+                float sum = 0;
+                for (float sample : calibrationSamples) {
+                    sum += sample;
+                }
+                float meanOpen = sum / calibrationSamples.size();
+                float adaptedThreshold = meanOpen * 0.5f;
+                blinkThreshold = Math.max(adaptedThreshold, 0.1f);
+                Log.d(TAG, "Adaptive threshold calibrated: " + blinkThreshold +
+                      " (mean open: " + meanOpen + ", samples: " + calibrationSamples.size() + ")");
+            } else {
+                Log.d(TAG, "Calibration ended with no valid samples, keeping threshold: " + blinkThreshold);
+            }
+            isCalibrating = false;
+            calibrationSamples.clear();
+        }
+    }
+
     public void reset() {
         leftEyeStates.clear();
         rightEyeStates.clear();
         frameCounter = 0;
         lastFrameRotation = 0;
         closedEyeFrameRotation = 0;
+        isCalibrating = false;
+        calibrationStartTime = 0;
+        calibrationSamples.clear();
     }
 
     @Override
@@ -442,12 +520,25 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
         }
     }
 
+    // Helper class to hold blink detection result from processEye
+    private static class BlinkResult {
+        boolean didBlink = false;
+        long blinkDuration = 0;
+    }
+
     private void processFaceResults(List<Face> faces, int frameWidth, int frameHeight) {
         WritableArray facesArray = Arguments.createArray();
-        
+        java.util.HashSet<Integer> seenTrackingIds = new java.util.HashSet<>();
+        long now = System.currentTimeMillis();
+
         for (Face face : faces) {
             WritableMap faceMap = Arguments.createMap();
-            
+
+            Integer trackingId = face.getTrackingId();
+            if (trackingId != null) {
+                seenTrackingIds.add(trackingId);
+            }
+
             // Bounding box
             WritableMap bounds = Arguments.createMap();
             bounds.putDouble("x", face.getBoundingBox().left);
@@ -455,37 +546,135 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
             bounds.putDouble("width", face.getBoundingBox().width());
             bounds.putDouble("height", face.getBoundingBox().height());
             faceMap.putMap("bounds", bounds);
-            
+
             faceMap.putDouble("confidence", 1.0);
-            
-            if (face.getTrackingId() != null) {
-                faceMap.putInt("trackingId", face.getTrackingId());
+
+            if (trackingId != null) {
+                faceMap.putInt("trackingId", trackingId);
             }
-            
+
             // Head pose
             WritableMap headPose = Arguments.createMap();
             headPose.putDouble("yaw", face.getHeadEulerAngleY());
             headPose.putDouble("pitch", face.getHeadEulerAngleX());
             headPose.putDouble("roll", face.getHeadEulerAngleZ());
             faceMap.putMap("headPose", headPose);
-            
+
             // Landmarks
             WritableMap landmarks = Arguments.createMap();
             Rect faceBounds = face.getBoundingBox();
 
+            BlinkResult leftBlinkResult = new BlinkResult();
+            BlinkResult rightBlinkResult = new BlinkResult();
+
             FaceLandmark leftEye = face.getLandmark(FaceLandmark.LEFT_EYE);
             WritableMap leftEyeData = processEye(
                     leftEye, face.getLeftEyeOpenProbability(),
-                    face.getTrackingId(), leftEyeStates, "left", faceBounds
+                    trackingId, leftEyeStates, faceBounds, leftBlinkResult
             );
             landmarks.putMap("leftEye", leftEyeData);
 
             FaceLandmark rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE);
             WritableMap rightEyeData = processEye(
                     rightEye, face.getRightEyeOpenProbability(),
-                    face.getTrackingId(), rightEyeStates, "right", faceBounds
+                    trackingId, rightEyeStates, faceBounds, rightBlinkResult
             );
             landmarks.putMap("rightEye", rightEyeData);
+
+            // Unified blink emission - prevents double-counting natural blinks
+            if (leftBlinkResult.didBlink || rightBlinkResult.didBlink) {
+                String eyeSide;
+                String blinkType;
+                int blinkCountToReport;
+                long duration;
+                float minProb;
+
+                EyeState leftState = trackingId != null ? leftEyeStates.get(trackingId) : null;
+                EyeState rightState = trackingId != null ? rightEyeStates.get(trackingId) : null;
+
+                if (leftBlinkResult.didBlink && rightBlinkResult.didBlink) {
+                    eyeSide = "both";
+                    blinkType = "blink";
+                    blinkCountToReport = Math.max(
+                            leftState != null ? leftState.blinkCount : 0,
+                            rightState != null ? rightState.blinkCount : 0);
+                    duration = Math.max(leftBlinkResult.blinkDuration, rightBlinkResult.blinkDuration);
+                    minProb = Math.min(
+                            leftState != null ? leftState.minProbDuringClosure : 1.0f,
+                            rightState != null ? rightState.minProbDuringClosure : 1.0f);
+                } else if (leftBlinkResult.didBlink) {
+                    eyeSide = "left";
+                    blinkType = "wink";
+                    blinkCountToReport = leftState != null ? leftState.blinkCount : 0;
+                    duration = leftBlinkResult.blinkDuration;
+                    minProb = leftState != null ? leftState.minProbDuringClosure : 1.0f;
+                } else {
+                    eyeSide = "right";
+                    blinkType = "wink";
+                    blinkCountToReport = rightState != null ? rightState.blinkCount : 0;
+                    duration = rightBlinkResult.blinkDuration;
+                    minProb = rightState != null ? rightState.minProbDuringClosure : 1.0f;
+                }
+
+                // Compute confidence score
+                float deltaScore = Math.min(Math.max((blinkThreshold - minProb) / blinkThreshold, 0), 1);
+                float optimalDuration = 150.0f;
+                float durationDeviation = Math.abs(duration - optimalDuration) / optimalDuration;
+                float durationScore = Math.min(Math.max(1.0f - durationDeviation, 0), 1);
+                float symmetryScore = (leftBlinkResult.didBlink && rightBlinkResult.didBlink) ? 1.0f : 0.7f;
+                float confidence = 0.4f * deltaScore + 0.3f * durationScore + 0.3f * symmetryScore;
+
+                Log.d(TAG, "Blink detected: " + eyeSide + " (type: " + blinkType +
+                      ", count: " + blinkCountToReport + ", duration: " + duration +
+                      "ms, confidence: " + String.format("%.2f", confidence) + ")");
+
+                WritableMap blinkEvent = Arguments.createMap();
+                blinkEvent.putDouble("timestamp", now);
+                blinkEvent.putString("eye", eyeSide);
+                if (trackingId != null) {
+                    blinkEvent.putInt("trackingId", trackingId);
+                }
+                blinkEvent.putInt("blinkCount", blinkCountToReport);
+                blinkEvent.putDouble("duration", duration);
+                blinkEvent.putString("blinkType", blinkType);
+                blinkEvent.putDouble("confidence", confidence);
+                blinkEvent.putDouble("minOpenProbability", minProb);
+
+                // Use STORED closed-eye frame for capture
+                if (captureOnBlink && closedEyeNv21Data != null && closedEyeFaceBounds != null) {
+                    byte[] savedNv21 = lastNv21Data;
+                    int savedWidth = lastFrameWidth;
+                    int savedHeight = lastFrameHeight;
+                    int savedRotation = lastFrameRotation;
+
+                    lastNv21Data = closedEyeNv21Data;
+                    lastFrameWidth = closedEyeFrameWidth;
+                    lastFrameHeight = closedEyeFrameHeight;
+                    lastFrameRotation = closedEyeFrameRotation;
+
+                    String base64Image = captureFrameAsBase64(closedEyeFaceBounds);
+
+                    lastNv21Data = savedNv21;
+                    lastFrameWidth = savedWidth;
+                    lastFrameHeight = savedHeight;
+                    lastFrameRotation = savedRotation;
+
+                    if (base64Image != null) {
+                        blinkEvent.putString("faceImage", base64Image);
+                        WritableMap boundsMap = Arguments.createMap();
+                        boundsMap.putInt("x", closedEyeFaceBounds.left);
+                        boundsMap.putInt("y", closedEyeFaceBounds.top);
+                        boundsMap.putInt("width", closedEyeFaceBounds.width());
+                        boundsMap.putInt("height", closedEyeFaceBounds.height());
+                        blinkEvent.putMap("faceBounds", boundsMap);
+                    }
+
+                    closedEyeNv21Data = null;
+                    closedEyeFaceBounds = null;
+                }
+
+                sendEvent(EVENT_BLINK_DETECTED, blinkEvent);
+            }
 
             // Extract mouth landmarks
             FaceLandmark mouthBottom = face.getLandmark(FaceLandmark.MOUTH_BOTTOM);
@@ -519,19 +708,25 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
             faceMap.putMap("landmarks", landmarks);
             facesArray.pushMap(faceMap);
         }
-        
+
+        // Evict stale eye state entries for faces no longer in frame
+        if (!seenTrackingIds.isEmpty()) {
+            leftEyeStates.keySet().retainAll(seenTrackingIds);
+            rightEyeStates.keySet().retainAll(seenTrackingIds);
+        }
+
         WritableMap result = Arguments.createMap();
         result.putArray("faces", facesArray);
-        result.putDouble("timestamp", System.currentTimeMillis());
+        result.putDouble("timestamp", now);
         result.putInt("frameWidth", frameWidth);
         result.putInt("frameHeight", frameHeight);
-        
+
         sendEvent(EVENT_FACE_DETECTED, result);
     }
 
     private WritableMap processEye(FaceLandmark eyeLandmark, Float openProbability,
                                     Integer trackingId, Map<Integer, EyeState> eyeStates,
-                                    String eyeSide, Rect faceBounds) {
+                                    Rect faceBounds, BlinkResult blinkResult) {
         WritableMap eyeData = Arguments.createMap();
 
         WritableMap position = Arguments.createMap();
@@ -551,13 +746,32 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
                 eyeStates.put(trackingId, eyeState);
             }
 
-            eyeState.currentProbability = openProbability;
-            eyeState.wasOpen = eyeState.isOpen;
-            eyeState.isOpen = openProbability > blinkThreshold;
+            // Adaptive threshold calibration
+            if (isCalibrating) {
+                processCalibrationSample(openProbability);
+            }
 
-            // CAPTURE FRAME WHEN EYE CLOSES (transition: open → closed)
-            // This ensures we get the closed-eye image, not the open-eye image
+            eyeState.currentProbability = openProbability;
+
+            // Apply EMA smoothing (Phase 2.1)
+            float alpha = 0.4f;
+            eyeState.smoothedProbability = alpha * openProbability + (1.0f - alpha) * eyeState.smoothedProbability;
+
+            eyeState.wasOpen = eyeState.isOpen;
+            eyeState.isOpen = eyeState.smoothedProbability > blinkThreshold;
+
+            long now = System.currentTimeMillis();
+
+            // Track minimum probability during closure (for confidence)
+            if (!eyeState.isOpen) {
+                eyeState.minProbDuringClosure = Math.min(eyeState.minProbDuringClosure, openProbability);
+            }
+
+            // CAPTURE FRAME WHEN EYE CLOSES (open -> closed transition)
             if (eyeState.wasOpen && !eyeState.isOpen) {
+                eyeState.closedTimestamp = now;
+                eyeState.minProbDuringClosure = openProbability;
+
                 if (captureOnBlink && lastNv21Data != null && faceBounds != null) {
                     closedEyeNv21Data = lastNv21Data.clone();
                     closedEyeFrameWidth = lastFrameWidth;
@@ -567,54 +781,24 @@ public class FaceDetectionProcessor implements VideoFrameProcessor {
                 }
             }
 
-            // DETECT BLINK (transition: closed → open)
-            if (!eyeState.wasOpen && eyeState.isOpen) {
-                eyeState.blinkCount++;
+            // DETECT BLINK (closed -> open transition)
+            // Don't emit during calibration
+            if (!eyeState.wasOpen && eyeState.isOpen && !isCalibrating) {
+                long blinkDuration = now - eyeState.closedTimestamp;
 
-                WritableMap blinkEvent = Arguments.createMap();
-                blinkEvent.putDouble("timestamp", System.currentTimeMillis());
-                blinkEvent.putString("eye", eyeSide);
-                blinkEvent.putInt("trackingId", trackingId);
-                blinkEvent.putInt("blinkCount", eyeState.blinkCount);
+                // Temporal validation (Phase 2.2)
+                boolean durationValid = (blinkDuration >= minBlinkDurationMs && blinkDuration <= maxBlinkDurationMs);
 
-                // Use STORED closed-eye frame instead of current frame
-                // This ensures we capture the frame with eyes closed, not open
-                if (captureOnBlink && closedEyeNv21Data != null && closedEyeFaceBounds != null) {
-                    // Temporarily swap to closed-eye data for capture
-                    byte[] savedNv21 = lastNv21Data;
-                    int savedWidth = lastFrameWidth;
-                    int savedHeight = lastFrameHeight;
-                    int savedRotation = lastFrameRotation;
+                // Debounce (Phase 2.3)
+                boolean cooldownPassed = (eyeState.lastBlinkTimestamp == 0 ||
+                                          (now - eyeState.lastBlinkTimestamp) >= blinkCooldownMs);
 
-                    lastNv21Data = closedEyeNv21Data;
-                    lastFrameWidth = closedEyeFrameWidth;
-                    lastFrameHeight = closedEyeFrameHeight;
-                    lastFrameRotation = closedEyeFrameRotation;
-
-                    String base64Image = captureFrameAsBase64(closedEyeFaceBounds);
-
-                    // Restore current frame data
-                    lastNv21Data = savedNv21;
-                    lastFrameWidth = savedWidth;
-                    lastFrameHeight = savedHeight;
-                    lastFrameRotation = savedRotation;
-
-                    if (base64Image != null) {
-                        blinkEvent.putString("faceImage", base64Image);
-                        WritableMap boundsMap = Arguments.createMap();
-                        boundsMap.putInt("x", closedEyeFaceBounds.left);
-                        boundsMap.putInt("y", closedEyeFaceBounds.top);
-                        boundsMap.putInt("width", closedEyeFaceBounds.width());
-                        boundsMap.putInt("height", closedEyeFaceBounds.height());
-                        blinkEvent.putMap("faceBounds", boundsMap);
-                    }
-
-                    // Clear stored closed-eye data
-                    closedEyeNv21Data = null;
-                    closedEyeFaceBounds = null;
+                if (durationValid && cooldownPassed) {
+                    eyeState.blinkCount++;
+                    eyeState.lastBlinkTimestamp = now;
+                    blinkResult.didBlink = true;
+                    blinkResult.blinkDuration = blinkDuration;
                 }
-
-                sendEvent(EVENT_BLINK_DETECTED, blinkEvent);
             }
 
             eyeData.putBoolean("isOpen", eyeState.isOpen);

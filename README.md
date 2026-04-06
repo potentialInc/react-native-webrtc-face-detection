@@ -21,9 +21,13 @@ This fork extends the original react-native-webrtc with powerful face detection 
 - Eye openness probability for each eye
 
 ### 😉 Blink Detection
-- Accurate blink detection with configurable thresholds
-- Blink event callbacks for real-time interaction
-- `useBlinkDetection` React hook for easy integration
+- **Accurate unified blink events** — natural blinks emit one event (`eye: "both"`), winks emit `"left"`/`"right"`
+- **EMA probability smoothing** eliminates false blinks from lighting noise
+- **Temporal validation** — rejects single-frame noise (< 50ms) and prolonged closure (> 800ms)
+- **Debounce cooldown** prevents rapid-fire false sequences
+- **Blink confidence score** (0–1) from probability delta, duration, and eye symmetry
+- **Adaptive thresholding** — optional per-user calibration for droopy eyelids, glasses, low light
+- `useBlinkDetection` React hook with `onBlink` callback, `isCalibrating` state, and fixed blink rate formula
 
 ### 📸 Frame Capture on Blink
 - **Automatic frame capture** when blink is detected
@@ -148,15 +152,32 @@ function VideoCall() {
 import { useBlinkDetection } from 'react-native-webrtc-face-detection';
 
 function BlinkTracker() {
-  const { blinkCount, lastBlinkTime } = useBlinkDetection({
-    enabled: true,
-    trackId: videoTrackId,
-    onBlink: (event) => {
-      console.log('Blink detected!', event);
-    },
-  });
+  const videoTrack = stream?.getVideoTracks()[0] ?? null;
 
-  return <Text>Blinks: {blinkCount}</Text>;
+  const { blinkCount, lastBlinkTime, getBlinkRate, enable, disable } = useBlinkDetection(
+    videoTrack,
+    {
+      minBlinkDurationMs: 50,   // reject noise (< 50ms)
+      maxBlinkDurationMs: 800,  // reject prolonged closure
+      blinkCooldownMs: 300,     // debounce between blinks
+    },
+    (event) => {
+      // 'both' = natural blink, 'left'/'right' = wink
+      console.log(`Blink: eye=${event.eye}, confidence=${event.confidence?.toFixed(2)}`);
+    }
+  );
+
+  useEffect(() => {
+    if (videoTrack) enable();
+    return () => { disable(); };
+  }, [videoTrack]);
+
+  return (
+    <>
+      <Text>Blinks: {blinkCount}</Text>
+      <Text>Rate: {getBlinkRate().toFixed(1)} BPM</Text>
+    </>
+  );
 }
 ```
 
@@ -196,12 +217,20 @@ function BlinkCaptureCamera() {
   const videoTrack = stream?.getVideoTracks()[0] ?? null;
 
   // Blink detection with frame capture
-  const { blinkCount, recentBlinks, enable, disable } = useBlinkDetection(videoTrack, {
-    captureOnBlink: true,    // Capture frame on blink
-    cropToFace: true,        // Crop to face region
-    imageQuality: 0.8,       // JPEG quality (0.0-1.0)
-    maxImageWidth: 480,      // Scale down if wider
-  });
+  // Pass onBlink callback to receive faceImage — images are NOT stored in recentBlinks
+  const { blinkCount, enable, disable } = useBlinkDetection(
+    videoTrack,
+    {
+      captureOnBlink: true,  // Capture frame on blink
+      cropToFace: true,      // Crop to face region
+      imageQuality: 0.8,     // JPEG quality (0.0-1.0)
+      maxImageWidth: 480,    // Scale down if wider
+    },
+    (event) => {
+      // faceImage is only available in this callback, not in recentBlinks
+      if (event.faceImage) setCapturedImage(event.faceImage);
+    }
+  );
 
   // Start camera
   useEffect(() => {
@@ -222,13 +251,7 @@ function BlinkCaptureCamera() {
     return () => { disable(); };
   }, [videoTrack]);
 
-  // Get latest captured image
-  useEffect(() => {
-    const latestBlink = recentBlinks[recentBlinks.length - 1];
-    if (latestBlink?.faceImage) {
-      setCapturedImage(latestBlink.faceImage);
-    }
-  }, [recentBlinks]);
+  // capturedImage is set directly in the onBlink callback above
 
   return (
     <View style={{ flex: 1 }}>
@@ -491,12 +514,21 @@ interface ImageAdjustmentConfig {
 
 // Face detection options (passed to hooks)
 interface FaceDetectionConfig {
-  frameSkipCount?: number;    // Process every Nth frame (default: 3)
-  blinkThreshold?: number;    // Eye open probability threshold (default: 0.3)
-  captureOnBlink?: boolean;   // Capture frame on blink (default: false)
-  cropToFace?: boolean;       // Crop to face bounds (default: true)
-  imageQuality?: number;      // JPEG quality 0.0-1.0 (default: 0.7)
-  maxImageWidth?: number;     // Max image width in pixels (default: 480)
+  frameSkipCount?: number;        // Process every Nth frame (default: 3)
+  blinkThreshold?: number;        // Eye open probability threshold (default: 0.3)
+  captureOnBlink?: boolean;       // Capture frame on blink (default: false)
+  cropToFace?: boolean;           // Crop to face bounds (default: true)
+  imageQuality?: number;          // JPEG quality 0.0-1.0 (default: 0.7)
+  maxImageWidth?: number;         // Max image width in pixels (default: 480)
+
+  // Blink validation
+  minBlinkDurationMs?: number;    // Minimum blink duration in ms (default: 50)
+  maxBlinkDurationMs?: number;    // Maximum blink duration in ms (default: 800)
+  blinkCooldownMs?: number;       // Minimum ms between consecutive blinks (default: 300)
+
+  // Adaptive thresholding
+  adaptiveThreshold?: boolean;    // Auto-calibrate threshold per user (default: false)
+  calibrationDurationMs?: number; // Calibration window in ms (default: 3000)
 }
 ```
 
@@ -549,12 +581,16 @@ interface HeadPose {
 }
 
 interface BlinkEvent {
-  timestamp: number;          // Blink timestamp (ms)
-  eye: 'left' | 'right';     // Which eye blinked
-  trackingId?: number;        // Face tracking ID
-  blinkCount?: number;        // Total blinks for this eye
-  faceImage?: string;         // Base64 JPEG (if captureOnBlink: true)
-  faceBounds?: BoundingBox;   // Face bounds at capture time
+  timestamp: number;                    // Blink timestamp (ms)
+  eye?: 'left' | 'right' | 'both';     // 'both' = natural blink, 'left'/'right' = wink
+  trackingId?: number;                  // Face tracking ID
+  blinkCount?: number;                  // Total blinks for this eye
+  faceImage?: string;                   // Base64 JPEG — only in onBlink callback, not recentBlinks
+  faceBounds?: BoundingBox;             // Face bounds at capture time
+  duration?: number;                    // Blink duration in ms
+  blinkType?: 'blink' | 'wink';        // 'blink' = both eyes, 'wink' = one eye
+  confidence?: number;                  // Detection quality score 0.0–1.0
+  minOpenProbability?: number;          // Lowest eye probability during closure
 }
 
 interface FaceDetectionResult {
@@ -588,11 +624,26 @@ interface FaceDetectionOverlayConfig {
 
 ### Hooks
 
-| Hook | Description |
-|------|-------------|
-| `useFaceDetection` | Returns detected faces and detection state |
-| `useBlinkDetection` | Tracks blinks with configurable callbacks |
-| `useImageAdjustment` | Controls exposure, contrast, saturation, color temperature |
+| Hook | Signature | Description |
+|------|-----------|-------------|
+| `useFaceDetection` | `(track, config?)` | Returns detected faces and detection state |
+| `useBlinkDetection` | `(track, config?, onBlink?)` | Tracks blinks; returns `blinkCount`, `recentBlinks`, `isCalibrating`, `getBlinkRate`, `enable`, `disable`, `resetCount`, `error` |
+| `useImageAdjustment` | `(track, config?)` | Controls exposure, contrast, saturation, color temperature |
+
+#### `useBlinkDetection` return values
+
+| Value | Type | Description |
+|-------|------|-------------|
+| `blinkCount` | `number` | Total blinks detected |
+| `lastBlinkTime` | `number \| null` | Timestamp of last blink (ms) |
+| `recentBlinks` | `BlinkEvent[]` | Last 10 blinks (without `faceImage`) |
+| `isEnabled` | `boolean` | Whether detection is active |
+| `isCalibrating` | `boolean` | True during adaptive threshold calibration |
+| `enable` | `() => Promise<void>` | Start blink detection |
+| `disable` | `() => Promise<void>` | Stop blink detection |
+| `resetCount` | `() => void` | Reset blink counter |
+| `getBlinkRate` | `() => number` | Current blink rate in BPM |
+| `error` | `Error \| null` | Last error, if any |
 
 ### Components
 
@@ -622,8 +673,13 @@ This project is a fork of [react-native-webrtc](https://github.com/react-native-
 ### What's Added in This Fork
 - Real-time face detection using Google ML Kit (iOS & Android)
 - Eye tracking with openness probability
-- Blink detection with React hooks
-- **Frame capture on blink** with face cropping
+- **Accurate blink detection** — unified events (`eye: "both"/"left"/"right"`), no double-counting
+- **EMA probability smoothing** — eliminates false blinks from frame noise
+- **Temporal validation** — min/max duration filtering (defaults: 50ms–800ms)
+- **Blink debounce cooldown** — prevents rapid-fire false sequences (default: 300ms)
+- **Blink confidence scoring** — weighted composite of probability delta, duration, and eye symmetry
+- **Adaptive thresholding** — optional per-user calibration for variable conditions
+- **Frame capture on blink** with face cropping (image delivered via `onBlink` callback)
 - Head pose estimation
 - Mouth and nose landmark detection
 - `useFaceDetection` and `useBlinkDetection` hooks

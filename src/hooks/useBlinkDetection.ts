@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { NativeModules, NativeEventEmitter } from 'react-native';
 
 import { BlinkEvent, FaceDetectionConfig } from '../FaceDetection.types';
@@ -12,6 +12,7 @@ const eventEmitter = new NativeEventEmitter(WebRTCModule);
  *
  * @param track The video track to perform blink detection on
  * @param config Optional configuration for face detection (required for blink detection)
+ * @param onBlink Optional callback invoked for each blink event (includes faceImage if captureOnBlink enabled)
  * @returns Object with blink tracking data and control functions
  *
  * @example
@@ -29,13 +30,18 @@ const eventEmitter = new NativeEventEmitter(WebRTCModule);
  */
 export function useBlinkDetection(
     track: MediaStreamTrack | null,
-    config?: FaceDetectionConfig
+    config?: FaceDetectionConfig,
+    onBlink?: (event: BlinkEvent) => void
 ) {
     const [ blinkCount, setBlinkCount ] = useState(0);
     const [ lastBlinkTime, setLastBlinkTime ] = useState<number | null>(null);
     const [ isEnabled, setIsEnabled ] = useState(false);
     const [ error, setError ] = useState<Error | null>(null);
     const [ recentBlinks, setRecentBlinks ] = useState<BlinkEvent[]>([]);
+    const [ isCalibrating, setIsCalibrating ] = useState(false);
+    const onBlinkRef = useRef(onBlink);
+
+    onBlinkRef.current = onBlink;
 
     // Enable blink detection (enables face detection under the hood)
     const enable = useCallback(async () => {
@@ -55,6 +61,14 @@ export function useBlinkDetection(
             await track.enableFaceDetection(config);
             setIsEnabled(true);
             setError(null);
+
+            if (config?.adaptiveThreshold) {
+                setIsCalibrating(true);
+                // Auto-clear calibrating state after calibration duration
+                const duration = config?.calibrationDurationMs ?? 3000;
+
+                setTimeout(() => setIsCalibrating(false), duration);
+            }
         } catch (err) {
             setError(err as Error);
             setIsEnabled(false);
@@ -70,6 +84,7 @@ export function useBlinkDetection(
         try {
             await track.disableFaceDetection();
             setIsEnabled(false);
+            setIsCalibrating(false);
             setError(null);
         } catch (err) {
             setError(err as Error);
@@ -94,12 +109,22 @@ export function useBlinkDetection(
             (event: BlinkEvent) => {
                 setBlinkCount(prev => prev + 1);
                 setLastBlinkTime(event.timestamp);
+
+                // Strip faceImage from stored events to reduce memory pressure (Phase 1.5)
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                const { faceImage, ...blinkWithoutImage } = event;
+
                 setRecentBlinks(prev => {
-                    const updated = [ ...prev, event ];
+                    const updated = [ ...prev, blinkWithoutImage ];
 
                     // Keep only last 10 blinks
                     return updated.slice(-10);
                 });
+
+                // Pass full event (including image) to callback
+                if (onBlinkRef.current) {
+                    onBlinkRef.current(event);
+                }
             }
         );
 
@@ -115,20 +140,22 @@ export function useBlinkDetection(
         }
     }, [ isEnabled, disable ]);
 
-    // Calculate blink rate (blinks per minute)
+    // Calculate blink rate (blinks per minute) - fixed N-1 intervals (Phase 2.4)
     const getBlinkRate = useCallback((): number => {
         if (recentBlinks.length < 2) {
             return 0;
         }
 
         const timeSpan = recentBlinks[recentBlinks.length - 1].timestamp - recentBlinks[0].timestamp;
-        const minutes = timeSpan / 60000; // Convert milliseconds to minutes
 
-        if (minutes === 0) {
+        // Need at least 1 second of data for a meaningful rate
+        if (timeSpan < 1000) {
             return 0;
         }
 
-        return recentBlinks.length / minutes;
+        const minutes = timeSpan / 60000; // Convert milliseconds to minutes
+
+        return (recentBlinks.length - 1) / minutes;
     }, [ recentBlinks ]);
 
     return {
@@ -143,7 +170,7 @@ export function useBlinkDetection(
         lastBlinkTime,
 
         /**
-         * Recent blink events (last 10)
+         * Recent blink events (last 10, without faceImage to save memory)
          */
         recentBlinks,
 
@@ -151,6 +178,11 @@ export function useBlinkDetection(
          * Whether blink detection is currently enabled
          */
         isEnabled,
+
+        /**
+         * Whether adaptive threshold calibration is in progress
+         */
+        isCalibrating,
 
         /**
          * Enable blink detection
@@ -178,4 +210,3 @@ export function useBlinkDetection(
         error,
     };
 }
-

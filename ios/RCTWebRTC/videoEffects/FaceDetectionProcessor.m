@@ -7,12 +7,16 @@
 #import <CoreVideo/CoreVideo.h>
 @import MLKitVision;
 
-// Simple eye state tracking (matching Android)
+// Eye state tracking with smoothing, temporal validation, and confidence
 @interface EyeState : NSObject
 @property (nonatomic, assign) BOOL isOpen;
 @property (nonatomic, assign) BOOL wasOpen;
 @property (nonatomic, assign) NSInteger blinkCount;
 @property (nonatomic, assign) CGFloat currentProbability;
+@property (nonatomic, assign) CGFloat smoothedProbability;       // EMA smoothed value
+@property (nonatomic, assign) NSTimeInterval closedTimestamp;    // When eye closed (ms)
+@property (nonatomic, assign) NSTimeInterval lastBlinkTimestamp; // Last blink time (ms) for debounce
+@property (nonatomic, assign) CGFloat minProbDuringClosure;      // Lowest prob while closed
 @end
 
 @implementation EyeState
@@ -23,6 +27,10 @@
         _wasOpen = YES;
         _blinkCount = 0;
         _currentProbability = 1.0;
+        _smoothedProbability = 1.0;
+        _closedTimestamp = 0;
+        _lastBlinkTimestamp = 0;
+        _minProbDuringClosure = 1.0;
     }
     return self;
 }
@@ -48,6 +56,10 @@
 @property (nonatomic, assign) RTCVideoRotation closedEyeFrameRotation;
 // I420 to BGRA conversion
 @property (nonatomic, strong) I420Converter *i420Converter;
+// Adaptive threshold calibration
+@property (nonatomic, assign) BOOL isCalibrating;
+@property (nonatomic, assign) NSTimeInterval calibrationStartTime;
+@property (nonatomic, strong) NSMutableArray<NSNumber *> *calibrationSamples;
 @end
 
 @implementation FaceDetectionProcessor
@@ -57,7 +69,7 @@
     if (self) {
         _eventEmitter = eventEmitter;
         _isEnabled = NO;
-        _frameSkipCount = 2;
+        _frameSkipCount = 3; // Matches documented default and Android
         _blinkThreshold = 0.3; // Same as Android (probability-based)
         _leftEyeStates = [NSMutableDictionary dictionary];
         _rightEyeStates = [NSMutableDictionary dictionary];
@@ -76,6 +88,16 @@
         _closedEyeFaceBounds = CGRectZero;
         _currentFrameRotation = RTCVideoRotation_0;
         _closedEyeFrameRotation = RTCVideoRotation_0;
+        // Blink validation defaults
+        _minBlinkDurationMs = 50;
+        _maxBlinkDurationMs = 800;
+        _blinkCooldownMs = 300;
+        // Adaptive threshold defaults
+        _adaptiveThreshold = NO;
+        _calibrationDurationMs = 3000;
+        _isCalibrating = NO;
+        _calibrationStartTime = 0;
+        _calibrationSamples = [NSMutableArray array];
 
         [self initializeFaceDetector];
     }
@@ -113,6 +135,49 @@
         _closedEyeFaceBounds = CGRectZero;
         _currentFrameRotation = RTCVideoRotation_0;
         _closedEyeFrameRotation = RTCVideoRotation_0;
+        _isCalibrating = NO;
+        _calibrationStartTime = 0;
+        [_calibrationSamples removeAllObjects];
+    }
+}
+
+- (void)startCalibrationIfNeeded {
+    if (_adaptiveThreshold && !_isCalibrating) {
+        _isCalibrating = YES;
+        _calibrationStartTime = [[NSDate date] timeIntervalSince1970] * 1000;
+        [_calibrationSamples removeAllObjects];
+        NSLog(@"[FaceDetection] Adaptive threshold calibration started");
+    }
+}
+
+- (void)processCalibrationSample:(CGFloat)openProbability {
+    if (!_isCalibrating) return;
+
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970] * 1000;
+
+    // Only collect samples that are likely open-eye (> 0.5)
+    if (openProbability > 0.5) {
+        [_calibrationSamples addObject:@(openProbability)];
+    }
+
+    // Check if calibration period is over
+    if (now - _calibrationStartTime >= _calibrationDurationMs) {
+        if (_calibrationSamples.count > 0) {
+            CGFloat sum = 0;
+            for (NSNumber *sample in _calibrationSamples) {
+                sum += sample.doubleValue;
+            }
+            CGFloat meanOpen = sum / _calibrationSamples.count;
+            CGFloat adaptedThreshold = meanOpen * 0.5;
+            _blinkThreshold = MAX(adaptedThreshold, 0.1);
+            NSLog(@"[FaceDetection] Adaptive threshold calibrated: %.3f (mean open: %.3f, samples: %lu)",
+                  _blinkThreshold, meanOpen, (unsigned long)_calibrationSamples.count);
+        } else {
+            NSLog(@"[FaceDetection] Calibration ended with no valid samples, keeping threshold: %.3f",
+                  _blinkThreshold);
+        }
+        _isCalibrating = NO;
+        [_calibrationSamples removeAllObjects];
     }
 }
 
@@ -348,12 +413,15 @@
                  timestamp:(int64_t)timestamp {
 
     NSMutableArray *facesArray = [NSMutableArray array];
+    NSMutableSet<NSNumber *> *seenTrackingIds = [NSMutableSet set];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970] * 1000;
 
     for (NSInteger i = 0; i < faces.count; i++) {
         MLKFace *face = faces[i];
 
         NSInteger trackingId = face.hasTrackingID ? face.trackingID : i;
         NSNumber *trackingKey = @(trackingId);
+        [seenTrackingIds addObject:trackingKey];
 
         // Get or create eye states
         EyeState *leftEyeState = self.leftEyeStates[trackingKey];
@@ -385,24 +453,105 @@
             boundingBox.size.height / frameHeight
         );
 
-        // Process eyes with direct probability from ML Kit
+        // Process eyes - returns eye data dict, blink detection is deferred
+        BOOL leftBlinked = NO;
+        BOOL rightBlinked = NO;
+        NSTimeInterval leftDuration = 0;
+        NSTimeInterval rightDuration = 0;
+
         NSDictionary *leftEyeData = [self processEye:face.leftEyeOpenProbability
                                             eyeState:leftEyeState
-                                             eyeSide:@"left"
                                           trackingId:trackingId
                                     normalizedBounds:normalizedBounds
-                                              bounds:bounds
                                                 face:face
-                                        landmarkType:MLKFaceLandmarkTypeLeftEye];
+                                        landmarkType:MLKFaceLandmarkTypeLeftEye
+                                          didBlink:&leftBlinked
+                                      blinkDuration:&leftDuration];
 
         NSDictionary *rightEyeData = [self processEye:face.rightEyeOpenProbability
                                              eyeState:rightEyeState
-                                              eyeSide:@"right"
                                            trackingId:trackingId
                                      normalizedBounds:normalizedBounds
-                                               bounds:bounds
                                                  face:face
-                                         landmarkType:MLKFaceLandmarkTypeRightEye];
+                                         landmarkType:MLKFaceLandmarkTypeRightEye
+                                            didBlink:&rightBlinked
+                                        blinkDuration:&rightDuration];
+
+        // Unified blink emission - prevents double-counting natural blinks
+        if (leftBlinked || rightBlinked) {
+            NSString *eyeSide;
+            NSString *blinkType;
+            NSInteger blinkCountToReport;
+            NSTimeInterval duration;
+            CGFloat minProb;
+
+            if (leftBlinked && rightBlinked) {
+                eyeSide = @"both";
+                blinkType = @"blink";
+                blinkCountToReport = MAX(leftEyeState.blinkCount, rightEyeState.blinkCount);
+                duration = MAX(leftDuration, rightDuration);
+                minProb = MIN(leftEyeState.minProbDuringClosure, rightEyeState.minProbDuringClosure);
+            } else if (leftBlinked) {
+                eyeSide = @"left";
+                blinkType = @"wink";
+                blinkCountToReport = leftEyeState.blinkCount;
+                duration = leftDuration;
+                minProb = leftEyeState.minProbDuringClosure;
+            } else {
+                eyeSide = @"right";
+                blinkType = @"wink";
+                blinkCountToReport = rightEyeState.blinkCount;
+                duration = rightDuration;
+                minProb = rightEyeState.minProbDuringClosure;
+            }
+
+            // Compute confidence score
+            CGFloat deltaScore = MIN(MAX((self.blinkThreshold - minProb) / self.blinkThreshold, 0), 1);
+            CGFloat optimalDuration = 150.0;
+            CGFloat durationDeviation = fabs(duration - optimalDuration) / optimalDuration;
+            CGFloat durationScore = MIN(MAX(1.0 - durationDeviation, 0), 1);
+            CGFloat symmetryScore = (leftBlinked && rightBlinked) ? 1.0 : 0.7;
+            CGFloat confidence = 0.4 * deltaScore + 0.3 * durationScore + 0.3 * symmetryScore;
+
+            NSLog(@"[FaceDetection] Blink detected: %@ (type: %@, count: %ld, duration: %.0fms, confidence: %.2f)",
+                  eyeSide, blinkType, (long)blinkCountToReport, duration, confidence);
+
+            if (self.eventEmitter) {
+                NSMutableDictionary *blinkBody = [@{
+                    @"timestamp": @(now),
+                    @"eye": eyeSide,
+                    @"trackingId": @(trackingId),
+                    @"blinkCount": @(blinkCountToReport),
+                    @"duration": @(duration),
+                    @"blinkType": blinkType,
+                    @"confidence": @(confidence),
+                    @"minOpenProbability": @(minProb)
+                } mutableCopy];
+
+                // Use stored closed-eye frame for capture
+                if (_captureOnBlink && _closedEyePixelBuffer) {
+                    NSString *base64Image = [self captureFrameAsBase64FromBuffer:_closedEyePixelBuffer
+                                                                           size:_closedEyeFrameSize
+                                                                     faceBounds:_closedEyeFaceBounds
+                                                                       rotation:_closedEyeFrameRotation];
+
+                    if (base64Image) {
+                        blinkBody[@"faceImage"] = base64Image;
+                        blinkBody[@"faceBounds"] = @{
+                            @"x": @(_closedEyeFaceBounds.origin.x * _closedEyeFrameSize.width),
+                            @"y": @(_closedEyeFaceBounds.origin.y * _closedEyeFrameSize.height),
+                            @"width": @(_closedEyeFaceBounds.size.width * _closedEyeFrameSize.width),
+                            @"height": @(_closedEyeFaceBounds.size.height * _closedEyeFrameSize.height)
+                        };
+                    }
+
+                    CVPixelBufferRelease(_closedEyePixelBuffer);
+                    _closedEyePixelBuffer = NULL;
+                }
+
+                [self.eventEmitter sendEventWithName:@"blinkDetected" body:blinkBody];
+            }
+        }
 
         // Extract mouth landmarks
         NSMutableDictionary *landmarksDict = [NSMutableDictionary dictionary];
@@ -453,10 +602,27 @@
         [facesArray addObject:faceDict];
     }
 
-    // Emit face detected event
+    // Evict stale eye state entries for faces no longer in frame (Phase 1.2)
+    NSMutableArray<NSNumber *> *staleKeys = [NSMutableArray array];
+    for (NSNumber *key in self.leftEyeStates) {
+        if (![seenTrackingIds containsObject:key]) {
+            [staleKeys addObject:key];
+        }
+    }
+    [self.leftEyeStates removeObjectsForKeys:staleKeys];
+
+    [staleKeys removeAllObjects];
+    for (NSNumber *key in self.rightEyeStates) {
+        if (![seenTrackingIds containsObject:key]) {
+            [staleKeys addObject:key];
+        }
+    }
+    [self.rightEyeStates removeObjectsForKeys:staleKeys];
+
+    // Emit face detected event with wall-clock timestamp (Phase 1.3)
     NSDictionary *result = @{
         @"faces": facesArray,
-        @"timestamp": @(timestamp),
+        @"timestamp": @(now),
         @"frameWidth": @(frameWidth),
         @"frameHeight": @(frameHeight)
     };
@@ -468,12 +634,15 @@
 
 - (NSDictionary *)processEye:(CGFloat)openProbability
                     eyeState:(EyeState *)eyeState
-                     eyeSide:(NSString *)eyeSide
                   trackingId:(NSInteger)trackingId
             normalizedBounds:(CGRect)normalizedBounds
-                      bounds:(NSDictionary *)bounds
                         face:(MLKFace *)face
-                landmarkType:(MLKFaceLandmarkType)landmarkType {
+                landmarkType:(MLKFaceLandmarkType)landmarkType
+                    didBlink:(BOOL *)outDidBlink
+               blinkDuration:(NSTimeInterval *)outBlinkDuration {
+
+    *outDidBlink = NO;
+    *outBlinkDuration = 0;
 
     // Extract eye landmark position from ML Kit
     CGFloat eyeX = 0;
@@ -494,20 +663,32 @@
         };
     }
 
-    eyeState.currentProbability = openProbability;
-    eyeState.wasOpen = eyeState.isOpen;
-    eyeState.isOpen = openProbability > self.blinkThreshold;
-
-    // Debug logging
-    static NSInteger debugCounter = 0;
-    debugCounter++;
-    if (debugCounter % 30 == 0) {
-        NSLog(@"[FaceDetection] %@ eye - probability: %.4f, threshold: %.4f, isOpen: %@",
-              eyeSide, openProbability, self.blinkThreshold, eyeState.isOpen ? @"YES" : @"NO");
+    // Adaptive threshold calibration
+    if (_isCalibrating) {
+        [self processCalibrationSample:openProbability];
     }
 
-    // CAPTURE FRAME WHEN EYE CLOSES (open → closed transition)
+    eyeState.currentProbability = openProbability;
+
+    // Apply EMA smoothing (Phase 2.1)
+    CGFloat alpha = 0.4;
+    eyeState.smoothedProbability = alpha * openProbability + (1.0 - alpha) * eyeState.smoothedProbability;
+
+    eyeState.wasOpen = eyeState.isOpen;
+    eyeState.isOpen = eyeState.smoothedProbability > self.blinkThreshold;
+
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970] * 1000;
+
+    // Track minimum probability during closure (for confidence)
+    if (!eyeState.isOpen) {
+        eyeState.minProbDuringClosure = MIN(eyeState.minProbDuringClosure, openProbability);
+    }
+
+    // CAPTURE FRAME WHEN EYE CLOSES (open -> closed transition)
     if (eyeState.wasOpen && !eyeState.isOpen) {
+        eyeState.closedTimestamp = now;
+        eyeState.minProbDuringClosure = openProbability;
+
         if (_captureOnBlink && _currentPixelBuffer) {
             if (_closedEyePixelBuffer) {
                 CVPixelBufferRelease(_closedEyePixelBuffer);
@@ -520,42 +701,23 @@
         }
     }
 
-    // DETECT BLINK (closed → open transition) - matching Android behavior
-    if (!eyeState.wasOpen && eyeState.isOpen) {
-        eyeState.blinkCount++;
-        NSLog(@"[FaceDetection] Blink detected on %@ eye! Count: %ld, probability: %.3f",
-              eyeSide, (long)eyeState.blinkCount, openProbability);
+    // DETECT BLINK (closed -> open transition)
+    // Don't emit during calibration
+    if (!eyeState.wasOpen && eyeState.isOpen && !_isCalibrating) {
+        NSTimeInterval blinkDuration = now - eyeState.closedTimestamp;
 
-        if (self.eventEmitter) {
-            NSMutableDictionary *blinkBody = [@{
-                @"timestamp": @([[NSDate date] timeIntervalSince1970] * 1000),
-                @"eye": eyeSide,
-                @"trackingId": @(trackingId),
-                @"blinkCount": @(eyeState.blinkCount)
-            } mutableCopy];
+        // Temporal validation (Phase 2.2)
+        BOOL durationValid = (blinkDuration >= _minBlinkDurationMs && blinkDuration <= _maxBlinkDurationMs);
 
-            // Use stored closed-eye frame
-            if (_captureOnBlink && _closedEyePixelBuffer) {
-                NSString *base64Image = [self captureFrameAsBase64FromBuffer:_closedEyePixelBuffer
-                                                                       size:_closedEyeFrameSize
-                                                                 faceBounds:_closedEyeFaceBounds
-                                                                   rotation:_closedEyeFrameRotation];
+        // Debounce (Phase 2.3)
+        BOOL cooldownPassed = (eyeState.lastBlinkTimestamp == 0 ||
+                               (now - eyeState.lastBlinkTimestamp) >= _blinkCooldownMs);
 
-                if (base64Image) {
-                    blinkBody[@"faceImage"] = base64Image;
-                    blinkBody[@"faceBounds"] = @{
-                        @"x": @(_closedEyeFaceBounds.origin.x * _closedEyeFrameSize.width),
-                        @"y": @(_closedEyeFaceBounds.origin.y * _closedEyeFrameSize.height),
-                        @"width": @(_closedEyeFaceBounds.size.width * _closedEyeFrameSize.width),
-                        @"height": @(_closedEyeFaceBounds.size.height * _closedEyeFrameSize.height)
-                    };
-                }
-
-                CVPixelBufferRelease(_closedEyePixelBuffer);
-                _closedEyePixelBuffer = NULL;
-            }
-
-            [self.eventEmitter sendEventWithName:@"blinkDetected" body:blinkBody];
+        if (durationValid && cooldownPassed) {
+            eyeState.blinkCount++;
+            eyeState.lastBlinkTimestamp = now;
+            *outDidBlink = YES;
+            *outBlinkDuration = blinkDuration;
         }
     }
 
